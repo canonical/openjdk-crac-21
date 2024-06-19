@@ -76,6 +76,9 @@
   product(bool, UseCpuAllocPath, false, DIAGNOSTIC,                     \
           "Use CPU_ALLOC code path in os::active_processor_count ")     \
                                                                         \
+  product(bool, CRaCCPUCountInit, false, "Reinitialize number of CPUs " \
+      "during -XX:CRaCRestoreFrom")                                     \
+                                                                        \
   product(bool, DumpPerfMapAtExit, false, DIAGNOSTIC,                   \
           "Write map file for Linux perf tool at exit")                 \
                                                                         \
@@ -110,5 +113,10 @@ define_pd_global(size_t, PreTouchParallelChunkSize, 4 * M);
 define_pd_global(bool, UseLargePages, false);
 define_pd_global(bool, UseLargePagesIndividualAllocation, false);
 define_pd_global(bool, UseThreadPriorities, true) ;
+
+// On some systems using SSSD files in this directory are left open
+// after calling getpwuid_r, getpwname_r, getgrgid_r, getgrname_r
+// or other functions in this family.
+define_pd_global(ccstrlist, CRAllowedOpenFilePrefixes, "/var/lib/sss/mc/");
 
 #endif // OS_LINUX_GLOBALS_LINUX_HPP

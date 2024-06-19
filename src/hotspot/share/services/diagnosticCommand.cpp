@@ -59,6 +59,10 @@
 #include "services/management.hpp"
 #include "services/nmtDCmd.hpp"
 #include "services/writeableFlags.hpp"
+#ifdef LINUX
+#include "attachListener_linux.hpp"
+#include "linuxAttachOperation.hpp"
+#endif //LINUX
 #include "utilities/debug.hpp"
 #include "utilities/events.hpp"
 #include "utilities/formatBuffer.hpp"
@@ -137,6 +141,8 @@ void DCmd::register_dcmds(){
   DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<CompilerDirectivesAddDCmd>(full_export, true, false));
   DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<CompilerDirectivesRemoveDCmd>(full_export, true, false));
   DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<CompilerDirectivesClearDCmd>(full_export, true, false));
+
+  DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<CheckpointDCmd>(full_export, true,false));
 
   // Enhanced JMX Agent Support
   // These commands won't be exported via the DiagnosticCommandMBean until an
@@ -1053,6 +1059,32 @@ void DebugOnCmdStartDCmd::execute(DCmdSource source, TRAPS) {
   }
 }
 #endif // INCLUDE_JVMTI
+
+void CheckpointDCmd::execute(DCmdSource source, TRAPS) {
+  Klass* k = SystemDictionary::resolve_or_fail(vmSymbols::jdk_crac_Core(),
+                                                 true, CHECK);
+  JavaValue result(T_OBJECT);
+  JavaCallArguments args;
+  args.push_long((jlong)output());
+  JavaCalls::call_static(&result, k,
+                         vmSymbols::checkpointRestoreInternal_name(),
+                         vmSymbols::checkpointRestoreInternal_signature(), &args, CHECK);
+  oop str = result.get_oop();
+  if (str != NULL) {
+    char* out = java_lang_String::as_utf8_string(str);
+    if (out[0] != '\0') {
+      outputStream* stream = output();
+#if defined(LINUX) && INCLUDE_SERVICES
+      assert(LinuxAttachListener::get_current_op(), "should exist");
+      if (LinuxAttachListener::get_current_op()->is_effectively_completed()) {
+        stream = tty;
+      }
+#endif //LINUX
+      stream->print_cr("An exception during a checkpoint operation:");
+      stream->print("%s", out);
+    }
+  }
+}
 
 ThreadDumpToFileDCmd::ThreadDumpToFileDCmd(outputStream* output, bool heap) :
                                            DCmdWithParser(output, heap),

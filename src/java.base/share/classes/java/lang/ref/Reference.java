@@ -25,6 +25,10 @@
 
 package java.lang.ref;
 
+import jdk.crac.Context;
+import jdk.crac.Resource;
+import jdk.internal.crac.Core;
+import jdk.internal.crac.JDKResource;
 import jdk.internal.misc.Unsafe;
 import jdk.internal.vm.annotation.ForceInline;
 import jdk.internal.vm.annotation.IntrinsicCandidate;
@@ -329,6 +333,16 @@ public abstract sealed class Reference<T>
             @Override
             public void runFinalization() {
                 Finalizer.runFinalization();
+            }
+
+            @Override
+            public <T> Reference<? extends T> pollReferenceQueue(ReferenceQueue<T> queue, long timeout) throws InterruptedException {
+                return queue.poll(timeout);
+            }
+
+            @Override
+            public void wakeupReferenceQueue(ReferenceQueue<?> queue) {
+                queue.wakeup();
             }
 
             @Override

@@ -27,9 +27,11 @@ package java.io;
 
 import java.nio.channels.FileChannel;
 
+import jdk.internal.crac.OpenResourcePolicies;
 import jdk.internal.access.JavaIORandomAccessFileAccess;
 import jdk.internal.access.SharedSecrets;
 import jdk.internal.misc.Blocker;
+import jdk.internal.crac.JDKFileResource;
 import jdk.internal.util.ByteArray;
 import sun.nio.ch.FileChannelImpl;
 
@@ -71,6 +73,7 @@ public class RandomAccessFile implements DataOutput, DataInput, Closeable {
     private final FileDescriptor fd;
 
     private final boolean rw;
+    private final int imode;
 
     /**
      * The path of the referenced file
@@ -89,6 +92,37 @@ public class RandomAccessFile implements DataOutput, DataInput, Closeable {
 
     private volatile FileChannel channel;
     private volatile boolean closed;
+
+    private final JDKFileResource resource = new JDKFileResource() {
+        private long offset;
+
+        @Override
+        protected FileDescriptor getFD() {
+            return fd;
+        }
+
+        @Override
+        protected String getPath() {
+            return path;
+        }
+
+        @Override
+        protected void closeBeforeCheckpoint(OpenResourcePolicies.Policy policy) throws IOException {
+            // We cannot synchronize this without making every other method call synchronized
+            offset = getFilePointer();
+            close();
+        }
+
+        @Override
+        protected void reopenAfterRestore(OpenResourcePolicies.Policy policy) throws IOException {
+            synchronized (closeLock) {
+                open(path, imode);
+                seek(offset);
+                RandomAccessFile.this.closed = false;
+                FileCleanable.register(fd);
+            }
+        }
+    };
 
     /**
      * Creates a random access file stream to read from, and optionally
@@ -270,6 +304,7 @@ public class RandomAccessFile implements DataOutput, DataInput, Closeable {
         fd = new FileDescriptor();
         fd.attach(this);
         path = name;
+        this.imode = imode;
         open(name, imode);
         FileCleanable.register(fd);   // open sets the fd, register the cleanup
     }

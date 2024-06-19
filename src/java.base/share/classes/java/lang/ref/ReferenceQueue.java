@@ -187,6 +187,29 @@ public class ReferenceQueue<T> {
         }
     }
 
+    Reference<? extends T> poll(long timeout) throws InterruptedException {
+        lock.lock();
+        try {
+            Reference<? extends T> r = poll0();
+            if (r != null) return r;
+            // any wake (including spurious) ends the wait
+            //noinspection ResultOfMethodCallIgnored
+            notEmpty.await(timeout, TimeUnit.MILLISECONDS);
+            return poll0();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    void wakeup() {
+        lock.lock();
+        try {
+            notEmpty.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /**
      * Removes the next reference object in this queue, blocking until either
      * one becomes available or the given timeout period expires.

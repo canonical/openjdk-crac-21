@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 1999, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2021, Azul Systems, Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -61,6 +62,7 @@ class os::Linux {
 
   static int active_processor_count();
 
+  static void initialize_processor_count();
   static void initialize_system_info();
 
   static int commit_memory_impl(char* addr, size_t bytes, bool exec);
@@ -277,6 +279,13 @@ class os::Linux {
   static int numa_available() { return _numa_available != nullptr ? _numa_available() : -1; }
   static int numa_tonode_memory(void *start, size_t size, int node) {
     return _numa_tonode_memory != nullptr ? _numa_tonode_memory(start, size, node) : -1;
+  }
+
+  static void initialize_cpu_count() {
+    initialize_processor_count();
+    if (cpu_to_node() != NULL) {
+      rebuild_cpu_to_node_map();
+    }
   }
 
   static bool is_running_in_interleave_mode() {

@@ -56,8 +56,12 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
+import jdk.crac.Context;
+import jdk.crac.Resource;
 import jdk.internal.access.JavaNetInetAddressAccess;
 import jdk.internal.access.SharedSecrets;
+import jdk.internal.crac.Core;
+import jdk.internal.crac.JDKResource;
 import jdk.internal.misc.Blocker;
 import jdk.internal.misc.VM;
 import jdk.internal.vm.annotation.Stable;
@@ -236,6 +240,12 @@ import static java.net.spi.InetAddressResolver.LookupPolicy.IPV6_FIRST;
  * </dd>
  * </dl>
  *
+ * @crac This class holds a cache of resolved hostname-address pairs;
+ * this cache is wiped out before checkpoint. Therefore, lookups after restore
+ * will cause name address resolution.
+ * This ensures that the addresses are up-to-date in the environment where
+ * the process is restored.
+ *
  * @spec https://www.rfc-editor.org/info/rfc1918
  *      RFC 1918: Address Allocation for Private Internets
  * @spec https://www.rfc-editor.org/info/rfc2365
@@ -354,6 +364,9 @@ public sealed class InetAddress implements Serializable permits Inet4Address, In
     @java.io.Serial
     private static final long serialVersionUID = 3286316764910316507L;
 
+    /* Resource registration uses weak references; we need to keep it locally. */
+    private static final JDKResource checkpointListener;
+
     // "java.net.preferIPv4Stack" system property value
     private static final String PREFER_IPV4_STACK_VALUE;
 
@@ -390,6 +403,20 @@ public sealed class InetAddress implements Serializable permits Inet4Address, In
                 }
         );
         init();
+        // DNS cache is cleared before the checkpoint; application restored at a later point
+        // or in a different environment should query DNS again.
+        checkpointListener = new JDKResource() {
+            @Override
+            public void beforeCheckpoint(Context<? extends Resource> context) throws Exception {
+                cache.clear();
+                expirySet.clear();
+            }
+
+            @Override
+            public void afterRestore(Context<? extends Resource> context) throws Exception {
+            }
+        };
+        Core.Priority.NORMAL.getContext().register(checkpointListener);
     }
 
     /**

@@ -121,6 +121,8 @@ class CollectedHeap : public CHeapObj<mtGC> {
   // Used for filler objects (static, but initialized in ctor).
   static size_t _filler_array_max_size;
 
+  bool _cleanup_unused;
+
   static size_t _stack_chunk_max_size; // 0 for no limit
 
   // Last time the whole heap has been examined in support of RMI
@@ -386,6 +388,12 @@ class CollectedHeap : public CHeapObj<mtGC> {
   // that it should answer "false" for the concurrent part of a concurrent
   // collector -- dld).
   bool is_gc_active() const { return _is_gc_active; }
+
+  void set_cleanup_unused(bool value) { _cleanup_unused = value; }
+  bool do_cleanup_unused() const { return _cleanup_unused; }
+
+  // G1UncommitRegionTask may be still pending after collect() has returned.
+  virtual void finish_collection() {}
 
   // Total number of GC collections (started)
   unsigned int total_collections() const { return _total_collections; }

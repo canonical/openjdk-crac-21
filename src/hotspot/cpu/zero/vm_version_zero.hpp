@@ -32,6 +32,11 @@
 class VM_Version : public Abstract_VM_Version {
  public:
   static void initialize();
+  static void crac_restore() {}
+  static void crac_restore_finalize() {}
+
+  // No _features_names[] available on this CPU.
+  static void insert_features_names(char* buf, size_t buflen, uint64_t features = _features) {}
 
   constexpr static bool supports_stack_watermark_barrier() { return true; }
 

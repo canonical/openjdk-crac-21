@@ -140,7 +140,7 @@ public:
 
 
 debug_only(static bool signal_sets_initialized = false);
-static sigset_t unblocked_sigs, vm_sigs, preinstalled_sigs;
+static sigset_t unblocked_sigs, blocked_sigs, vm_sigs, preinstalled_sigs;
 
 // Our own signal handlers should never ever get replaced by a third party one.
 //  To check that, and to aid with diagnostics, store a copy of the handler setup
@@ -1544,6 +1544,13 @@ static void signal_sets_init() {
   if (!ReduceSignalUsage) {
     sigaddset(&vm_sigs, BREAK_SIGNAL);
   }
+
+  sigemptyset(&blocked_sigs);
+// RESTORE_SIGNAL is used only on Linux, other platform don't send this
+#ifdef LINUX
+  sigaddset(&blocked_sigs, RESTORE_SIGNAL);
+#endif
+
   debug_only(signal_sets_initialized = true);
 }
 
@@ -1552,6 +1559,11 @@ static void signal_sets_init() {
 static sigset_t* unblocked_signals() {
   assert(signal_sets_initialized, "Not initialized");
   return &unblocked_sigs;
+}
+
+static sigset_t* blocked_signals() {
+  assert(signal_sets_initialized, "Not initialized");
+  return &blocked_sigs;
 }
 
 // These are the signals that are blocked while a (non-VM) thread is
@@ -1571,6 +1583,7 @@ void PosixSignals::hotspot_sigmask(Thread* thread) {
   osthread->set_caller_sigmask(caller_sigmask);
 
   pthread_sigmask(SIG_UNBLOCK, unblocked_signals(), nullptr);
+  pthread_sigmask(SIG_BLOCK, blocked_signals(), nullptr);
 
   if (!ReduceSignalUsage) {
     if (thread->is_VM_thread()) {

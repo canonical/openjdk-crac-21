@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2001, 2023, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012, 2021 SAP SE. All rights reserved.
+ * Copyright (c) 2020, 2021, Azul Systems, Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,7 +31,7 @@
 #include "memory/allocation.inline.hpp"
 #include "memory/resourceArea.hpp"
 #include "oops/oop.inline.hpp"
-#include "os_posix.inline.hpp"
+//#include "os_posix.inline.hpp"
 #include "runtime/globals_extension.hpp"
 #include "runtime/handles.inline.hpp"
 #include "runtime/os.hpp"
@@ -40,6 +41,10 @@
 #if defined(LINUX)
 #include "os_linux.hpp"
 #endif
+
+#ifdef LINUX
+#include "perfMemory_linux.hpp"
+#endif //LINUX
 
 // put OS-includes here
 # include <sys/types.h>
@@ -1340,3 +1345,80 @@ void PerfMemory::detach(char* addr, size_t bytes) {
 
   unmap_shared(addr, bytes);
 }
+
+#ifdef LINUX
+bool PerfMemoryLinux::checkpoint() {
+  if (!backing_store_file_name) {
+    return true;
+  }
+
+  void *anon = ::mmap(nullptr, PerfMemory::capacity(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (anon == MAP_FAILED) {
+    tty->print_cr("Cannot allocate new memory for perfdata: %s", os::strerror(errno));
+    return false;
+  }
+  // Note: we might be losing updates that happen between this copy and mremap
+  // TODO: consider acquiring PeriodicTask_lock around this
+  memcpy(anon, PerfMemory::start(), PerfMemory::used());
+  if (mremap(anon, PerfMemory::capacity(), PerfMemory::capacity(), MREMAP_FIXED | MREMAP_MAYMOVE, PerfMemory::start()) == MAP_FAILED) {
+    tty->print_cr("Cannot remap perfdata memory as anonymous: %s", os::strerror(errno));
+    if (munmap(anon, PerfMemory::capacity())) {
+      tty->print_cr("Cannot unmap unused private perfdata memory: %s", os::strerror(errno));
+    }
+    return false;
+  }
+
+  remove_file(backing_store_file_name);
+
+  return true;
+}
+
+bool PerfMemoryLinux::restore() {
+  if (!backing_store_file_name) {
+    return true;
+  }
+
+  int vmid = os::current_process_id();
+  char* user_name = get_user_name(geteuid());
+  if (!user_name) {
+    return false;
+  }
+  char* dirname = get_user_tmp_dir(user_name, vmid, -1);
+  if (!make_user_tmp_dir(dirname)) {
+    return false;
+  }
+
+  int fd;
+  RESTARTABLE(::open(backing_store_file_name, O_RDWR|O_CREAT|O_NOFOLLOW, S_IRUSR|S_IWUSR), fd);
+  if (fd == OS_ERR) {
+    tty->print_cr("Cannot open shared perfdata file: %s", os::strerror(errno));
+    return false;
+  }
+
+  if (::ftruncate(fd, PerfMemory::capacity())) {
+    tty->print_cr("Cannot restore (ftruncate) perfdata file size: %s", os::strerror(errno));
+    ::close(fd);
+    return false;
+  }
+
+  void* shared = ::mmap(nullptr, PerfMemory::capacity(), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+  if (MAP_FAILED == shared) {
+    tty->print_cr("cannot mmap shared perfdata file: %s", os::strerror(errno));
+    ::close(fd);
+    return false;
+  }
+  ::close(fd);
+
+  // Here is another place where we might lose the update
+  memcpy(shared, PerfMemory::start(), PerfMemory::used());
+  if (::mremap(shared, PerfMemory::capacity(), PerfMemory::capacity(), MREMAP_FIXED | MREMAP_MAYMOVE, PerfMemory::start()) == MAP_FAILED) {
+    tty->print_cr("Cannot remap shared perfdata: %s", os::strerror(errno));
+    if (munmap(shared, PerfMemory::capacity())) {
+      tty->print_cr("Cannot unmap the shared memory: %s", os::strerror(errno));
+    }
+    return false;
+  }
+
+  return true;
+}
+#endif //LINUX

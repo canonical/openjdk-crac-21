@@ -34,6 +34,13 @@
 #include "jli_util.h"
 #include "jni.h"
 
+#ifndef WIN32
+#include <errno.h>
+#endif
+#ifdef LINUX
+#include <syscall.h>
+#endif
+
 /*
  * Entry point.
  */
@@ -53,6 +60,149 @@ WinMain(HINSTANCE inst, HINSTANCE previnst, LPSTR cmdline, int cmdshow)
     __initenv = _environ;
 
 #else /* JAVAW */
+
+#ifndef _WIN32
+#include <sys/wait.h>
+
+static int is_checkpoint = 0;
+static const int crac_min_pid_default = 128;
+static int crac_min_pid = 0;
+static int is_min_pid_set = 0;
+
+static void parse_checkpoint(const char *arg) {
+    if (!is_checkpoint) {
+        const char *checkpoint_arg = "-XX:CRaCCheckpointTo";
+        const int len = strlen(checkpoint_arg);
+        if (0 == strncmp(arg, checkpoint_arg, len)) {
+            is_checkpoint = 1;
+        }
+    }
+    if (!is_min_pid_set) {
+        const char *checkpoint_arg = "-XX:CRaCMinPid=";
+        const int len = strlen(checkpoint_arg);
+        if (0 == strncmp(arg, checkpoint_arg, len)) {
+            crac_min_pid = atoi(arg + len);
+            is_min_pid_set = 1;
+        }
+    }
+}
+
+static pid_t g_child_pid = -1;
+
+static int wait_for_children() {
+    int status = -1;
+    pid_t pid;
+    do {
+        int st = 0;
+        pid = wait(&st);
+        if (pid == g_child_pid) {
+            status = st;
+        }
+    } while (-1 != pid || ECHILD != errno);
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+
+    if (WIFSIGNALED(status)) {
+        // Try to terminate the current process with the same signal
+        // as the child process was terminated
+        const int sig = WTERMSIG(status);
+        signal(sig, SIG_DFL);
+        raise(sig);
+        // Signal was ignored, return 128+n as bash does
+        // see https://linux.die.net/man/1/bash
+        return 128+sig;
+    }
+
+    return 1;
+}
+
+static void sighandler(int sig, siginfo_t *info, void *param) {
+    if (0 < g_child_pid) {
+        kill(g_child_pid, sig);
+    }
+}
+
+static void setup_sighandler() {
+    struct sigaction sigact;
+    sigfillset(&sigact.sa_mask);
+    sigact.sa_flags = SA_SIGINFO;
+    sigact.sa_sigaction = sighandler;
+
+    const int MaxSignalValue = 31;
+    for (int sig = 1; sig <= MaxSignalValue; ++sig) {
+        if (sig == SIGKILL || sig == SIGSTOP) {
+            continue;
+        }
+        if (-1 == sigaction(sig, &sigact, NULL)) {
+            perror("sigaction");
+        }
+    }
+
+    sigset_t allset;
+    sigfillset(&allset);
+    if (-1 == sigprocmask(SIG_UNBLOCK, &allset, NULL)) {
+        perror("sigprocmask");
+    }
+}
+
+static int set_last_pid(int pid) {
+#ifdef LINUX
+    char buf[11]; // enough for int32
+    const int len = snprintf(buf, sizeof(buf), "%d", pid);
+    if (0 > len || sizeof(buf) < (size_t)len) {
+        return EINVAL;
+    }
+    const char *last_pid_filename = "/proc/sys/kernel/ns_last_pid";
+    const int last_pid_file = open(last_pid_filename, O_WRONLY|O_TRUNC, 0666);
+    if (0 > last_pid_file) {
+        return errno;
+    }
+    int res = 0;
+    if (len > write(last_pid_file, buf, len)) {
+        res = errno;
+    }
+    close(last_pid_file);
+    return res;
+#else
+    return EPERM;
+#endif
+}
+
+static void spin_last_pid(int pid) {
+    const int MaxSpinCount = pid < 1000 ? 1000 : pid;
+    int cnt = MaxSpinCount;
+    int child = 0;
+    int prev = 0;
+    do {
+        child = fork();
+        if (0 > child) {
+            perror("spin_last_pid clone");
+            exit(1);
+        }
+        if (0 == child) {
+            exit(0);
+        }
+        if (child < prev) {
+            fprintf(stderr, "%s: Invalid argument (%d)\n", __FUNCTION__, pid);
+            exit(1);
+        }
+        if (0 >= cnt) {
+            fprintf(stderr, "%s: Can't reach pid %d, out of try count. Current pid=%d\n", __FUNCTION__, pid, child);
+            exit(1);
+        }
+        prev = child;
+        int status;
+        if (0 > waitpid(child, &status, 0)) {
+            perror("spin_last_pid waitpid");
+            exit(1);
+        }
+        --cnt;
+    } while (child < pid);
+}
+#endif // _WIN32
+
 JNIEXPORT int
 main(int argc, char **argv)
 {
@@ -143,6 +293,7 @@ main(int argc, char **argv)
         }
         // Iterate the rest of command line
         for (i = 1; i < argc; i++) {
+            parse_checkpoint(argv[i]);
             JLI_List argsInFile = JLI_PreprocessArg(argv[i], JNI_TRUE);
             if (NULL == argsInFile) {
                 JLI_List_add(args, JLI_StringDup(argv[i]));
@@ -161,6 +312,46 @@ main(int argc, char **argv)
         // add the NULL pointer at argv[argc]
         JLI_List_add(args, NULL);
         margv = args->elements;
+    }
+
+    const int is_init = 1 == getpid();
+    if (is_init && !is_min_pid_set) {
+        crac_min_pid = crac_min_pid_default;
+    }
+    const int needs_pid_adjust = getpid() < crac_min_pid;
+    if (is_checkpoint && (is_init || needs_pid_adjust)) {
+        // Move PID value for new processes to a desired value
+        // to avoid PID conflicts on restore.
+        if (needs_pid_adjust) {
+            const int res = set_last_pid(crac_min_pid);
+            if (EPERM == res || EACCES == res || EROFS == res) {
+                spin_last_pid(crac_min_pid);
+            } else if (0 != res) {
+                fprintf(stderr, "set_last_pid: %s\n", strerror(res));
+                exit(1);
+            }
+        }
+
+        // Avoid unexpected process completion when checkpointing under docker container run
+        // by creating the main process waiting for children before exit.
+        g_child_pid = fork();
+        if (0 == g_child_pid && needs_pid_adjust && getpid() < crac_min_pid) {
+            if (is_min_pid_set) {
+                fprintf(stderr, "Error: Can't adjust PID to min PID %d, current PID %d\n", crac_min_pid, (int)getpid());
+                exit(1);
+            } else {
+                fprintf(stderr,
+                        "Warning: Can't adjust PID to min PID %d, current PID %d.\n"
+                        "This message can be suppressed by '-XX:CRaCMinPid=1' option\n",
+                        crac_min_pid, (int)getpid());
+            }
+        }
+        if (0 < g_child_pid) {
+            // The main process should forward signals to the child.
+            setup_sighandler();
+            const int status = wait_for_children();
+            exit(status);
+        }
     }
 #endif /* WIN32 */
     return JLI_Launch(margc, margv,

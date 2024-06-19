@@ -31,6 +31,8 @@ import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.lang.invoke.MethodHandles;
+
 import java.lang.ref.Cleaner.Cleanable;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -125,6 +127,11 @@ public final class NioSocketImpl extends SocketImpl implements PlatformSocketImp
     // used by read to emulate legacy behavior, protected by readLock
     private boolean readEOF;
     private boolean connectionReset;
+
+    static {
+        // trigger eager initialization
+        new FileDispatcherImpl();
+    }
 
     /**
      * Creates an instance of this SocketImpl.
@@ -1206,7 +1213,7 @@ public final class NioSocketImpl extends SocketImpl implements PlatformSocketImp
     /**
      * Returns an action to close the given file descriptor.
      */
-    private static Runnable closerFor(FileDescriptor fd, boolean stream) {
+    private static Runnable closerFor0(FileDescriptor fd, boolean stream) {
         if (stream) {
             return () -> {
                 try {
@@ -1228,6 +1235,21 @@ public final class NioSocketImpl extends SocketImpl implements PlatformSocketImp
             };
         }
     }
+
+    private static Runnable closerFor(FileDescriptor fd, boolean stream) {
+
+        // FIXME ensure FileDispatcherImpl's Resource is registered before the closer is used,
+        // otherwise the closer during beforeCheckpoint may be the first one to access
+        // FileDescriptor, and then Dispatcher Resource will be blocked for registration.
+        try {
+            MethodHandles.lookup().ensureInitialized(FileDispatcherImpl.class);
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException(e);
+        }
+
+        return closerFor0(fd, stream);
+    }
+
 
     /**
      * Attempts to acquire the given lock within the given waiting time.

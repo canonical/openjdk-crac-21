@@ -220,9 +220,14 @@ public final class DefaultImageBuilder implements ImageBuilder {
                 Path lib = root.resolve(LIB_DIRNAME);
                 if (Files.isDirectory(lib)) {
                     forEachPath(lib,
-                        (path, attrs) -> path.getFileName().toString().equals("jspawnhelper")
-                                      || path.getFileName().toString().equals("jexec"),
-                        this::setExecutable);
+                        (path, attrs) -> {
+                            String fileName = path.getFileName().toString();
+                            return fileName.equals("jspawnhelper")
+                                || fileName.equals("jexec")
+                                || fileName.equals("criuengine")
+                                || fileName.equals("pauseengine")
+                                || fileName.equals("simengine");
+                        }, this::setExecutable);
                 }
 
                 // read-only legal notices/license files

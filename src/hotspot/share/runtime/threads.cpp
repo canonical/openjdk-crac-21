@@ -59,6 +59,7 @@
 #include "prims/jvmtiAgentList.hpp"
 #include "prims/jvm_misc.hpp"
 #include "runtime/arguments.hpp"
+#include "runtime/crac.hpp"
 #include "runtime/fieldDescriptor.inline.hpp"
 #include "runtime/flags/jvmFlagLimit.hpp"
 #include "runtime/handles.inline.hpp"
@@ -408,8 +409,25 @@ void Threads::initialize_jsr292_core_classes(TRAPS) {
   initialize_class(vmSymbols::java_lang_invoke_MethodHandleNatives(), CHECK);
 }
 
+jint Threads::check_for_restore(JavaVMInitArgs* args) {
+  if (Arguments::is_restore_option_set(args)) {
+    if (!Arguments::parse_options_for_restore(args)) {
+      return JNI_ERR;
+    }
+    crac::restore();
+    if (!CRaCIgnoreRestoreIfUnavailable) {
+      // FIXME switch to unified hotspot logging
+      warning("cannot restore");
+      return JNI_ERR;
+    }
+  }
+  return JNI_OK;
+}
+
 jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   extern void JDK_Version_init();
+
+  if (check_for_restore(args) != JNI_OK) return JNI_ERR;
 
   // Preinitialize version info.
   VM_Version::early_initialize();
@@ -474,6 +492,8 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   if (PauseAtStartup) {
     os::pause();
   }
+
+  crac::vm_create_start();
 
   HOTSPOT_VM_INIT_BEGIN();
 

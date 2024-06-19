@@ -1849,6 +1849,13 @@ bool os::release_memory(char* addr, size_t bytes) {
   return res;
 }
 
+void os::cleanup_memory(char* addr, size_t bytes) {
+  char* start = (char*)align_up(addr, os::vm_page_size());
+  char* end = (char*)align_down(addr + bytes, os::vm_page_size());
+  os::uncommit_memory(start, end - start);
+  os::commit_memory(start, end - start, false);
+}
+
 // Prints all mappings
 void os::print_memory_mappings(outputStream* st) {
   os::print_memory_mappings(nullptr, SIZE_MAX, st);

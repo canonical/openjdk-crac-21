@@ -69,6 +69,7 @@ import java.util.zip.ZipFile;
 import jdk.internal.access.JavaNetURLAccess;
 import jdk.internal.access.JavaUtilZipFileAccess;
 import jdk.internal.access.SharedSecrets;
+import jdk.internal.util.jar.PersistentJarFile;
 import sun.net.util.URLUtil;
 import sun.net.www.ParseUtil;
 import sun.security.action.GetPropertyAction;
@@ -805,7 +806,7 @@ public class URLClassPath {
                 if (!p.exists()) {
                     throw new FileNotFoundException(p.getPath());
                 }
-                return checkJar(new JarFile(new File(p.getPath()), true, ZipFile.OPEN_READ,
+                return checkJar(new PersistentJarFile(new File(p.getPath()), true, ZipFile.OPEN_READ,
                         JarFile.runtimeVersion()));
             }
             @SuppressWarnings("deprecation")

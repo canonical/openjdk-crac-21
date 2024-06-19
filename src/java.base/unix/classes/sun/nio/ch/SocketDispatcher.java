@@ -67,7 +67,7 @@ class SocketDispatcher extends UnixDispatcher {
     }
 
     void close(FileDescriptor fd) throws IOException {
-        close0(fd);
+        closeAndMark(fd);
     }
 
     void preClose(FileDescriptor fd) throws IOException {

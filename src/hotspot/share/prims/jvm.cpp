@@ -71,6 +71,7 @@
 #include "runtime/arguments.hpp"
 #include "runtime/atomic.hpp"
 #include "runtime/continuation.hpp"
+#include "runtime/crac.hpp"
 #include "runtime/globals_extension.hpp"
 #include "runtime/handles.inline.hpp"
 #include "runtime/init.hpp"
@@ -3907,6 +3908,11 @@ JVM_END
 
 JVM_LEAF(jint, JVM_FindSignal(const char *name))
   return os::get_signal_number(name);
+JVM_END
+
+JVM_ENTRY(jobjectArray, JVM_Checkpoint(JNIEnv *env, jarray fd_arr, jobjectArray obj_arr, jboolean dry_run, jlong jcmd_stream))
+  Handle ret = crac::checkpoint(fd_arr, obj_arr, dry_run, jcmd_stream, CHECK_NULL);
+  return (jobjectArray) JNIHandles::make_local(THREAD, ret());
 JVM_END
 
 JVM_ENTRY(void, JVM_VirtualThreadStart(JNIEnv* env, jobject vthread))

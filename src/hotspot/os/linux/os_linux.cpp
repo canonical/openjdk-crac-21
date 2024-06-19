@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 1999, 2024, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2015, 2024 SAP SE. All rights reserved.
+ * Copyright (c) 2017, 2022, Azul Systems, Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,6 +25,7 @@
  */
 
 // no precompiled headers
+#include "classfile/classLoader.hpp"
 #include "classfile/vmSymbols.hpp"
 #include "code/icBuffer.hpp"
 #include "code/vtableStubs.hpp"
@@ -68,6 +70,7 @@
 #include "semaphore_posix.hpp"
 #include "services/memTracker.hpp"
 #include "services/runtimeService.hpp"
+#include "services/writeableFlags.hpp"
 #include "utilities/align.hpp"
 #include "utilities/decoder.hpp"
 #include "utilities/defaultStream.hpp"
@@ -83,12 +86,13 @@
 #endif
 
 // put OS-includes here
+# include <arpa/inet.h>
 # include <ctype.h>
 # include <stdlib.h>
 # include <sys/types.h>
 # include <sys/mman.h>
-# include <sys/stat.h>
 # include <sys/select.h>
+# include <sys/sysmacros.h>
 # include <pthread.h>
 # include <signal.h>
 # include <endian.h>
@@ -105,7 +109,6 @@
 # include <sys/socket.h>
 # include <pwd.h>
 # include <poll.h>
-# include <fcntl.h>
 # include <string.h>
 # include <syscall.h>
 # include <sys/sysinfo.h>
@@ -115,6 +118,7 @@
 # include <stdint.h>
 # include <inttypes.h>
 # include <sys/ioctl.h>
+# include <libgen.h>
 # include <linux/elf-em.h>
 # include <sys/prctl.h>
 #ifdef __GLIBC__
@@ -440,8 +444,13 @@ static const char *unstable_chroot_error = "/proc file system not found.\n"
                      "Java may be unstable running multithreaded in a chroot "
                      "environment on Linux when /proc filesystem is not mounted.";
 
-void os::Linux::initialize_system_info() {
+void os::Linux::initialize_processor_count() {
   set_processor_count(sysconf(_SC_NPROCESSORS_CONF));
+  assert(processor_count() > 0, "linux error");
+}
+
+void os::Linux::initialize_system_info() {
+  initialize_processor_count();
   if (processor_count() == 1) {
     pid_t pid = os::Linux::gettid();
     char fname[32];
@@ -454,7 +463,6 @@ void os::Linux::initialize_system_info() {
     }
   }
   _physical_memory = (julong)sysconf(_SC_PHYS_PAGES) * (julong)sysconf(_SC_PAGESIZE);
-  assert(processor_count() > 0, "linux error");
 }
 
 void os::init_system_properties_values() {

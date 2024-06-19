@@ -47,6 +47,7 @@ import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
 import jdk.internal.access.JavaIOFileDescriptorAccess;
 import jdk.internal.access.SharedSecrets;
+import jdk.internal.crac.JDKFdResource;
 import jdk.internal.util.OperatingSystem;
 import jdk.internal.util.StaticProperty;
 import sun.security.action.GetPropertyAction;
@@ -625,8 +626,15 @@ final class ProcessImpl extends Process {
      * the process exits, via the processExited hook.
      */
     private static class ProcessPipeOutputStream extends BufferedOutputStream {
+        private final JDKFdResource resource;
+
         ProcessPipeOutputStream(int fd) {
-            super(new FileOutputStream(newFileDescriptor(fd)));
+            this(newFileDescriptor(fd));
+        }
+
+        private ProcessPipeOutputStream(FileDescriptor fd) {
+            super(new FileOutputStream(fd));
+            resource = new PipeResource(this, fd);
         }
 
         /** Called by the process reaper thread when the process exits. */

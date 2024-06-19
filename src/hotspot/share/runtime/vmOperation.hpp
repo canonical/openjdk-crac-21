@@ -116,6 +116,7 @@
   template(GTestStopSafepoint)                    \
   template(JFROldObject)                          \
   template(JvmtiPostObjectFree)                   \
+  template(VM_Crac)                               \
   template(RendezvousGCThreads)
 
 class Thread;

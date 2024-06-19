@@ -789,6 +789,9 @@
   template(toFileURL_signature,                             "(Ljava/lang/String;)Ljava/net/URL;")                 \
   template(url_void_signature,                              "(Ljava/net/URL;)V")                                  \
   template(url_array_classloader_void_signature,            "([Ljava/net/URL;Ljava/lang/ClassLoader;)V")          \
+  template(jdk_crac_Core,                          "jdk/crac/Core")                                               \
+  template(checkpointRestoreInternal_name,         "checkpointRestoreInternal")                                   \
+  template(checkpointRestoreInternal_signature,    "(J)Ljava/lang/String;")                                       \
                                                                                                                   \
   /* Thread.dump_to_file jcmd */                                                                                  \
   template(jdk_internal_vm_ThreadDumper,           "jdk/internal/vm/ThreadDumper")                                \

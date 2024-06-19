@@ -25,12 +25,18 @@
 
 package sun.security.provider;
 
+import jdk.crac.Context;
+import jdk.crac.Resource;
+import jdk.internal.crac.Core;
+
 import java.io.IOException;
 import java.io.InvalidObjectException;
 import java.security.MessageDigest;
 import java.security.SecureRandomSpi;
 import java.security.NoSuchAlgorithmException;
 import java.security.NoSuchProviderException;
+import java.util.Arrays;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.Arrays;
 
 /**
@@ -49,13 +55,24 @@ import java.util.Arrays;
  * object should be seeded, using
  * <a href="#engineSetSeed(byte[])">engineSetSeed</a>.
  *
+ * @crac If this class is created using the {@link #SecureRandom() no-arg constructor}
+ * and never {@link #engineSetSeed(byte[]) reseeded} it is automatically reseeded
+ * after restore from a checkpoint. Therefore, after restore the sequences produced
+ * during different runs should differ (and the application will consume system entropy).
+ * If a seed was provided externally the application might depend on the sequence
+ * produced by this generator, therefore it is not reseeded.
+ * If this behaviour is not desired the application should {@link javax.crac.Context#register(javax.crac.Resource) register}
+ * a resource and in the {@link javax.crac.Resource#afterRestore(javax.crac.Context) afterRestore method}
+ * reseed it using the {@link #engineSetSeed(byte[])}.
+
+ *
  * @author Benjamin Renaud
  * @author Josh Bloch
  * @author Gadi Guy
  */
 
 public final class SecureRandom extends SecureRandomSpi
-implements java.io.Serializable {
+implements java.io.Serializable, jdk.internal.crac.JDKResource {
 
     @java.io.Serial
     private static final long serialVersionUID = 3581829991155417889L;
@@ -65,6 +82,8 @@ implements java.io.Serializable {
     private byte[] state;
     private byte[] remainder;
     private int remCount;
+    private boolean clearStateOnCheckpoint = true;
+    private ReentrantLock objLock = new ReentrantLock();
 
     /**
      * An empty constructor that creates an unseeded SecureRandom object.
@@ -82,6 +101,10 @@ implements java.io.Serializable {
      * depending on the underlying hardware.  Successive calls run
      * quickly because they rely on the same (internal) pseudo-random
      * number generator for their seed bits.
+     *
+     * @crac Instances created using this constructor are automatically
+     * reseeded upon restore from a checkpoint.
+     * See {@link SecureRandom} for details.
      */
     public SecureRandom() {
         init(null);
@@ -90,6 +113,10 @@ implements java.io.Serializable {
     /**
      * This constructor is used to instantiate the private seeder object
      * with a given seed from the SeedGenerator.
+     *
+     * @crac Instances created using this constructor are <strong>not</strong>
+     * reseeded upon restore from a checkpoint.
+     * See {@link SecureRandom} for details.
      *
      * @param seed the seed.
      */
@@ -121,6 +148,7 @@ implements java.io.Serializable {
         if (seed != null) {
            engineSetSeed(seed);
         }
+        Core.Priority.SECURE_RANDOM.getContext().register(this);
     }
 
     /**
@@ -153,16 +181,34 @@ implements java.io.Serializable {
      * replaces, the existing seed. Thus, repeated calls are guaranteed
      * never to reduce randomness.
      *
+     * @crac After this method is called the instance is <strong>not</strong>
+     * reseeded upon restore from a checkpoint.
+     * See {@link SecureRandom} for details.
+     *
      * @param seed the seed.
      */
     @Override
-    public synchronized void engineSetSeed(byte[] seed) {
+    public void engineSetSeed(byte[] seed) {
+        objLock.lock();
+        try {
+            // check if objLock has not been already acquired in beforeCheckpoint
+            if(objLock.getHoldCount() > 1) {
+                throw new IllegalStateException("SHA1PRNG object is invalidated");
+            }
+            setSeedImpl(seed);
+        } finally {
+            objLock.unlock();
+        }
+    }
+
+    private void setSeedImpl(byte[] seed) {
         if (state != null) {
             digest.update(state);
             Arrays.fill(state, (byte) 0);
         }
         state = digest.digest(seed);
         remCount = 0;
+        clearStateOnCheckpoint = false;
     }
 
     private static void updateState(byte[] state, byte[] output) {
@@ -190,25 +236,68 @@ implements java.io.Serializable {
         }
     }
 
+    private void invalidate() {
+        assert objLock.isHeldByCurrentThread();
+        if (state != null) {
+            Arrays.fill(state, (byte)0);
+        }
+        state = null;
+        if (remainder != null) {
+            Arrays.fill(remainder, (byte)0);
+        }
+        remainder = null;
+        remCount = 0;
+    }
+
+    @Override
+    public void beforeCheckpoint(Context<? extends Resource> context) throws Exception {
+        objLock.lock();
+        if (clearStateOnCheckpoint) {
+            invalidate();
+        }
+    }
+
+    @Override
+    public void afterRestore(Context<? extends Resource> context) throws Exception {
+        objLock.unlock();
+    }
+
     /**
      * This static object will be seeded by SeedGenerator, and used
      * to seed future instances of SHA1PRNG SecureRandoms.
      * <p>
      * Bloch, Effective Java Second Edition: Item 71
      */
-    private static class SeederHolder {
+    private static class SeederHolder implements jdk.internal.crac.JDKResource {
+        private static final SeederHolder seederHolder = new SeederHolder();
+        private final SecureRandom seeder;
 
-        private static final SecureRandom seeder;
-
-        static {
+        private SeederHolder() {
             /*
              * Call to SeedGenerator.generateSeed() to add additional
              * seed material (likely from the Native implementation).
              */
             seeder = new SecureRandom(SeedGenerator.getSystemEntropy());
-            byte [] b = new byte[DIGEST_SIZE];
+            byte[] b = new byte[DIGEST_SIZE];
             SeedGenerator.generateSeed(b);
             seeder.engineSetSeed(b);
+            Core.Priority.SEEDER_HOLDER.getContext().register(this);
+        }
+
+        public static SecureRandom getSeeder() {
+            return seederHolder.seeder;
+        }
+
+        @Override
+        public void beforeCheckpoint(Context<? extends Resource> context) throws Exception {
+            seeder.invalidate();
+        }
+
+        @Override
+        public void afterRestore(Context<? extends Resource> context) throws Exception {
+            byte[] b = new byte[DIGEST_SIZE];
+            SeedGenerator.generateSeed(b);
+            seeder.setSeedImpl(b);
         }
     }
 
@@ -218,51 +307,59 @@ implements java.io.Serializable {
      * @param result the array to be filled in with random bytes.
      */
     @Override
-    public synchronized void engineNextBytes(byte[] result) {
-        int index = 0;
-        int todo;
-        byte[] output = remainder;
-
-        if (state == null) {
-            byte[] seed = new byte[DIGEST_SIZE];
-            SeederHolder.seeder.engineNextBytes(seed);
-            state = digest.digest(seed);
-        }
-
-        // Use remainder from last time
-        int r = remCount;
-        if (r > 0) {
-            // How many bytes?
-            todo = Math.min(result.length - index, DIGEST_SIZE - r);
-            // Copy the bytes, zero the buffer
-            for (int i = 0; i < todo; i++) {
-                result[i] = output[r];
-                output[r++] = 0;
+    public void engineNextBytes(byte[] result) {
+        objLock.lock();
+        try {
+            // verify if objLock is already acquired in beforeCheckpoint
+            if(objLock.getHoldCount() > 1) {
+                throw new IllegalStateException("SHA1PRNG object is invalidated");
             }
-            remCount += todo;
-            index += todo;
-        }
+            int index = 0;
+            int todo;
+            byte[] output = remainder;
 
-        // If we need more bytes, make them.
-        while (index < result.length) {
-            // Step the state
-            digest.update(state);
-            output = digest.digest();
-            updateState(state, output);
-
-            // How many bytes?
-            todo = Math.min((result.length - index), DIGEST_SIZE);
-            // Copy the bytes, zero the buffer
-            for (int i = 0; i < todo; i++) {
-                result[index++] = output[i];
-                output[i] = 0;
+            if (state == null) {
+                byte[] seed = new byte[DIGEST_SIZE];
+                SeederHolder.getSeeder().engineNextBytes(seed);
+                state = digest.digest(seed);
             }
-            remCount += todo;
-        }
 
-        // Store remainder for next time
-        remainder = output;
-        remCount %= DIGEST_SIZE;
+            // Use remainder from last time
+            int r = remCount;
+            if (r > 0) {
+                // How many bytes?
+                todo = Math.min(result.length - index, DIGEST_SIZE - r);
+                // Copy the bytes, zero the buffer
+                for (int i = 0; i < todo; i++) {
+                    result[i] = output[r];
+                    output[r++] = 0;
+                }
+                remCount += todo;
+                index += todo;
+            }
+            // If we need more bytes, make them.
+            while (index < result.length) {
+                // Step the state
+                digest.update(state);
+                output = digest.digest();
+                updateState(state, output);
+
+                // How many bytes?
+                todo = Math.min((result.length - index), DIGEST_SIZE);
+                // Copy the bytes, zero the buffer
+                for (int i = 0; i < todo; i++) {
+                    result[index++] = output[i];
+                    output[i] = 0;
+                }
+                remCount += todo;
+            }
+
+            // Store remainder for next time
+            remainder = output;
+            remCount %= DIGEST_SIZE;
+        } finally {
+            objLock.unlock();
+        }
     }
 
     /*

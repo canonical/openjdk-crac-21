@@ -1143,6 +1143,7 @@ private:
 public:
   bool sleep(jlong millis);
   bool sleep_nanos(jlong nanos);
+  void wakeup_sleep() { _SleepEvent->unpark(); }
 
   // java.lang.Thread interruption support
   void interrupt();

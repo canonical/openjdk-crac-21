@@ -72,6 +72,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
+import jdk.internal.crac.JDKSocketResource;
 import jdk.internal.access.JavaNioAccess;
 import jdk.internal.access.SharedSecrets;
 import jdk.internal.ref.CleanerFactory;
@@ -2067,5 +2068,31 @@ class DatagramChannelImpl
 
     static {
         IOUtil.load();
+    }
+
+    private class Resource extends JDKSocketResource {
+        public Resource() {
+            super(DatagramChannelImpl.this);
+        }
+
+        @Override
+        protected FileDescriptor getFD() {
+            return fd;
+        }
+
+        @Override
+        protected SocketAddress localAddress() {
+            return localAddress;
+        }
+
+        @Override
+        protected SocketAddress remoteAddress() {
+            return remoteAddress;
+        }
+
+        @Override
+        protected void closeBeforeCheckpoint() throws IOException {
+            close();
+        }
     }
 }

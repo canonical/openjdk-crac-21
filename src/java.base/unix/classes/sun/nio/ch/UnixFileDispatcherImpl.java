@@ -28,8 +28,12 @@ package sun.nio.ch;
 import java.io.FileDescriptor;
 import java.io.IOException;
 
+import jdk.crac.Context;
+import jdk.crac.Resource;
 import jdk.internal.access.JavaIOFileDescriptorAccess;
 import jdk.internal.access.SharedSecrets;
+import jdk.internal.crac.Core;
+import jdk.internal.crac.JDKResource;
 
 class UnixFileDispatcherImpl extends FileDispatcher {
     private static final int MAP_INVALID = -1;

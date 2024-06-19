@@ -214,6 +214,10 @@ public class SecureRandom extends java.util.Random {
      * "{@docRoot}/../specs/security/standard-names.html#securerandom-number-generation-algorithms">
      * Java Security Standard Algorithm Names Specification</a>
      * for information about standard RNG algorithm names.
+     *
+     * @crac Instances created by this constructor are automatically reseeded
+     * after restore from a checkpoint.
+     * See {@link sun.security.provider.SecureRandom} for details.
      */
     public SecureRandom() {
         /*
@@ -255,6 +259,10 @@ public class SecureRandom extends java.util.Random {
      * "{@docRoot}/../specs/security/standard-names.html#securerandom-number-generation-algorithms">
      * Java Security Standard Algorithm Names Specification</a>
      * for information about standard RNG algorithm names.
+     *
+     * @crac Instances created by this constructor are <strong>not</strong>
+     * reseeded after restore from a checkpoint.
+     * See {@link sun.security.provider.SecureRandom} for details.
      *
      * @param seed the seed.
      * @throws NullPointerException if {@code seed} is {@code null}
@@ -357,6 +365,8 @@ public class SecureRandom extends java.util.Random {
      * <p> Note that the list of registered providers may be retrieved via
      * the {@link Security#getProviders() Security.getProviders()} method.
      *
+     * @crac The checkpoint/restore behaviour depends on security provider implementation.
+     *
      * @implNote
      * The JDK Reference Implementation additionally uses the
      * {@code jdk.security.provider.preferred}
@@ -404,6 +414,8 @@ public class SecureRandom extends java.util.Random {
      * <p> Note that the list of registered providers may be retrieved via
      * the {@link Security#getProviders() Security.getProviders()} method.
      *
+     * @crac The checkpoint/restore behaviour depends on security provider implementation.
+     *
      * @param algorithm the name of the RNG algorithm.
      * See the {@code SecureRandom} section in the <a href=
      * "{@docRoot}/../specs/security/standard-names.html#securerandom-number-generation-algorithms">
@@ -447,6 +459,8 @@ public class SecureRandom extends java.util.Random {
      * {@code SecureRandomSpi} implementation from the specified provider
      * is returned.  Note that the specified provider does not
      * have to be registered in the provider list.
+     *
+     * @crac The checkpoint/restore behaviour depends on security provider implementation.
      *
      * @param algorithm the name of the RNG algorithm.
      * See the {@code SecureRandom} section in the <a href=
@@ -494,6 +508,8 @@ public class SecureRandom extends java.util.Random {
      *
      * <p> Note that the list of registered providers may be retrieved via
      * the {@link Security#getProviders() Security.getProviders()} method.
+     *
+     * @crac The checkpoint/restore behaviour depends on security provider implementation.
      *
      * @implNote
      * The JDK Reference Implementation additionally uses the
@@ -552,6 +568,8 @@ public class SecureRandom extends java.util.Random {
      * <p> Note that the list of registered providers may be retrieved via
      * the {@link Security#getProviders() Security.getProviders()} method.
      *
+     * @crac The checkpoint/restore behaviour depends on security provider implementation.
+     *
      * @param algorithm the name of the RNG algorithm.
      * See the {@code SecureRandom} section in the <a href=
      * "{@docRoot}/../specs/security/standard-names.html#securerandom-number-generation-algorithms">
@@ -603,6 +621,8 @@ public class SecureRandom extends java.util.Random {
      * {@code SecureRandomSpi} implementation from the specified
      * provider is returned.  Note that the specified provider
      * does not have to be registered in the provider list.
+     *
+     * @crac The checkpoint/restore behaviour depends on security provider implementation.
      *
      * @param algorithm the name of the RNG algorithm.
      * See the {@code SecureRandom} section in the <a href=

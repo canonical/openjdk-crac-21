@@ -2550,6 +2550,7 @@
   declare_constant(JVMFlagOrigin::ATTACH_ON_DEMAND)                       \
   declare_constant(JVMFlagOrigin::INTERNAL)                               \
   declare_constant(JVMFlagOrigin::JIMAGE_RESOURCE)                        \
+  declare_constant(JVMFlagOrigin::CRAC_RESTORE)                           \
   declare_constant(JVMFlag::VALUE_ORIGIN_MASK)                            \
   declare_constant(JVMFlag::WAS_SET_ON_COMMAND_LINE)
 

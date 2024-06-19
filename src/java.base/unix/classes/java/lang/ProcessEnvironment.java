@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2003, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, Azul Systems, Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -54,6 +55,10 @@
 
 package java.lang;
 
+import jdk.crac.Context;
+import jdk.crac.Resource;
+import jdk.internal.crac.Core;
+
 import java.util.*;
 
 import static java.lang.ProcessImpl.JNU_CHARSET;
@@ -61,8 +66,26 @@ import static java.lang.ProcessImpl.JNU_CHARSET;
 
 final class ProcessEnvironment
 {
-    private static final HashMap<Variable,Value> theEnvironment;
-    private static final Map<String,String> theUnmodifiableEnvironment;
+    private static class CracSubscriber
+            implements jdk.internal.crac.JDKResource {
+
+        CracSubscriber() {
+            Core.Priority.NORMAL.getContext().register(this);
+        }
+
+        @Override
+        public void beforeCheckpoint(Context<? extends Resource> context) throws Exception {
+        }
+
+        @Override
+        public void afterRestore(Context<? extends Resource> context) throws Exception {
+            ProcessEnvironment.updateEnvironment();
+        }
+    }
+
+    private static HashMap<Variable,Value> theEnvironment;
+    private static Map<String,String> theUnmodifiableEnvironment;
+    private static final CracSubscriber theCracSubscriber;
     static final int MIN_NAME_LENGTH = 0;
 
     static {
@@ -79,6 +102,8 @@ final class ProcessEnvironment
         theUnmodifiableEnvironment
             = Collections.unmodifiableMap
             (new StringEnvironment(theEnvironment));
+
+        theCracSubscriber = new CracSubscriber();
     }
 
     /* Only for use by System.getenv(String) */
@@ -101,6 +126,20 @@ final class ProcessEnvironment
     /* Only for use by Runtime.exec(...String[]envp...) */
     static Map<String,String> emptyEnvironment(int capacity) {
         return new StringEnvironment(new HashMap<>(capacity));
+    }
+
+    static private void updateEnvironment() {
+        byte[][] environ = environ();
+        // Read environment variables back to front,
+        // so that earlier variables override later ones.
+        for (int i = environ.length-1; i > 0; i-=2) {
+            theEnvironment.put(Variable.valueOf(environ[i-1]),
+                               Value.valueOf(environ[i]));
+        }
+
+        theUnmodifiableEnvironment
+            = Collections.unmodifiableMap
+            (new StringEnvironment(theEnvironment));
     }
 
     private static native byte[][] environ();

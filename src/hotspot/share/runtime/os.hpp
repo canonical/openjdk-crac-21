@@ -446,6 +446,8 @@ class os: AllStatic {
   static bool   uncommit_memory(char* addr, size_t bytes, bool executable = false);
   static bool   release_memory(char* addr, size_t bytes);
 
+  static void   cleanup_memory(char* addr, size_t bytes);
+
   // Does the platform support trimming the native heap?
   static bool can_trim_native_heap();
 
@@ -608,6 +610,10 @@ class os: AllStatic {
   // Note: only safe to use in fatal error situations.
   static int fork_and_exec(const char *cmd);
 
+  static int exec_child_process_and_wait(const char *path, const char *argv[]);
+
+  static int execv(const char *path, const char *argv[]);
+
   // Call ::exit() on all platforms
   ATTRIBUTE_NORETURN static void exit(int num);
 
@@ -660,8 +666,13 @@ class os: AllStatic {
   static struct dirent* readdir(DIR* dirp);
   static int            closedir(DIR* dirp);
 
+  static int mkdir(const char *pathname);
+  static int rmdir(const char *pathname);
+
   static const char*    get_temp_directory();
   static const char*    get_current_directory(char *buf, size_t buflen);
+
+  static bool is_path_absolute(const char *path);
 
   static void           prepare_native_symbols();
 

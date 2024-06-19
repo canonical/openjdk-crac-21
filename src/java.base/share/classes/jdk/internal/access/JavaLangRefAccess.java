@@ -25,6 +25,12 @@
 
 package jdk.internal.access;
 
+
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
+
+import jdk.internal.crac.Core;
+
 import java.lang.ref.ReferenceQueue;
 
 public interface JavaLangRefAccess {
@@ -50,6 +56,17 @@ public interface JavaLangRefAccess {
      * Invoked by Runtime.runFinalization()
      */
     void runFinalization();
+
+
+    /**
+     * Calls package-private {@link ReferenceQueue#poll(long)}.
+     */
+    <T> Reference<? extends T> pollReferenceQueue(ReferenceQueue<T> queue, long timeout) throws InterruptedException;
+
+    /**
+     * Calls package-private {@link ReferenceQueue#wakeup()}.
+     */
+    void wakeupReferenceQueue(ReferenceQueue<?> queue);
 
     /**
      * Constructs a new NativeReferenceQueue.

@@ -1247,7 +1247,28 @@ Strings introduces the regression
 In both of these scenarios, disabling Compact Strings makes sense.
 .RE
 .TP
-\f[V]-XX:ErrorFile=\f[R]\f[I]filename\f[R]
+\f[V]-XX:CRaCCheckpointTo=\f[R]\f[I]directory\f[R]
+The CRaC (Coordinated Restore at Checkpoint) Project provides checkpointing of
+a running Java program into an image directory. Restoring from the image should
+solve some of the problematic start-up and warm-up times.
+.PP
+This option defines a path to the snapshot which is currently a directory. The
+directory will be created if it does not exist, but no parent directories are
+created.
+.RS
+.RE
+.TP
+\f[V]-XX:CRaCRestoreFrom=\f[R]\f[I]directory\f[R]
+Restores a snapshot created by
+\f[V]-XX:CRaCCheckpointTo=\f[R]\f[I]directory\f[R].
+.RS
+.RE
+.TP
+\f[V]-XX:CRaCMinPid=\f[R]value\f[R]
+A desired minimal PID value for checkpoint'ed process. Ignored on restore.
+.RS
+.RE
+.TP
 Specifies the path and file name to which error data is written when an
 irrecoverable error occurs.
 By default, this file is created in the current working directory and
@@ -2243,6 +2264,15 @@ compilation.
 Setting \f[V]CompileThresholdScaling\f[R] to 0 is equivalent to
 disabling compilation.
 .TP
+\f[V]-XX:CPUFeatures=\f[R]\f[I]0xnumber\f[R]
+CPU feature set, use -XX:CPUFeatures=0xnumber with -XX:CRaCCheckpointTo when
+you get an error during -XX:CRaCRestoreFrom on a different machine.
+\f[V]-XX:CPUFeatures=native\f[R] is the default.
+\f[V]-XX:CPUFeatures=generic\f[R] is compatible with any CPU but not as slow
+as \f[V]-XX:CPUFeatures=0\f[R].
+.RS
+.RE
+.TP
 \f[V]-XX:+DoEscapeAnalysis\f[R]
 Enables the use of escape analysis.
 This option is enabled by default.
@@ -2502,6 +2532,12 @@ buffer) and instruction cache behavior due to improved locality.
 The feature is enabled by default if tiered compilation is enabled
 (\f[V]-XX:+TieredCompilation\f[R] ) and the reserved code cache size
 (\f[V]-XX:ReservedCodeCacheSize\f[R]) is at least 240 MB.
+.RE
+.TP
+\f[V]-XX:+ShowCPUFeatures\f[R]
+Show features of this CPU to be possibly used for the
+\f[V]-XX:CPUFeatures=0xnumber\f[R] option.
+.RS
 .RE
 .TP
 \f[V]-XX:StartAggressiveSweepingAt=\f[R]\f[I]percent\f[R]

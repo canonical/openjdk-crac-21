@@ -54,8 +54,8 @@
 // only in this file, because the macrology requires single-token type names.
 
 // The optional extra_attrs parameter may have one of the following values:
-// DIAGNOSTIC, EXPERIMENTAL, or MANAGEABLE. Currently extra_attrs can be used
-// only with product/product_pd flags.
+// DIAGNOSTIC, EXPERIMENTAL, MANAGEABLE or RESTORE_SETTABLE. Currently
+// extra_attrs can be used only with product/product_pd flags.
 //
 // DIAGNOSTIC options are not meant for VM tuning or for product modes.
 //    They are to be used for VM quality assurance or field diagnosis
@@ -98,6 +98,9 @@
 //      and not reuse state related to the flag state at any given time.
 //    - you want the flag to be queried programmatically by the customers.
 //
+// RESTORE_SETTABLE are flags that can be set during restore from a snapshot.
+//    All MANAGEABLE flags are implicitly RESTORE_SETTABLE but
+//    RESTORE_SETTABLE are not MANAGEABLE.
 
 //
 // range is a macro that will expand to min and max arguments for range
@@ -174,10 +177,12 @@ const int ObjectAlignmentInBytes = 8;
   product(bool, AlwaysSafeConstructors, false, EXPERIMENTAL,                \
           "Force safe construction, as if all fields are final.")           \
                                                                             \
-  product(bool, UnlockDiagnosticVMOptions, trueInDebug, DIAGNOSTIC,         \
+  product(bool, UnlockDiagnosticVMOptions, trueInDebug,                     \
+          DIAGNOSTIC | RESTORE_SETTABLE,                                    \
           "Enable normal processing of flags relating to field diagnostics")\
                                                                             \
-  product(bool, UnlockExperimentalVMOptions, false, EXPERIMENTAL,           \
+  product(bool, UnlockExperimentalVMOptions, false,                         \
+          EXPERIMENTAL | RESTORE_SETTABLE,                                  \
           "Enable normal processing of flags relating to experimental "     \
           "features")                                                       \
                                                                             \
@@ -1972,6 +1977,67 @@ const int ObjectAlignmentInBytes = 8;
           false AARCH64_ONLY(DEBUG_ONLY(||true)),                           \
              "Mark all threads after a safepoint, and clear on a modify "   \
              "fence. Add cleanliness checks.")                              \
+                                                                            \
+  develop(bool, TraceOptimizedUpcallStubs, false,                           \
+                "Trace optimized upcall stub generation")                   \
+                                                                            \
+  product(ccstr, CRaCCheckpointTo, NULL, RESTORE_SETTABLE,                  \
+        "Path to checkpoint image directory")                               \
+                                                                            \
+  product(ccstr, CRaCRestoreFrom, NULL, RESTORE_SETTABLE,                   \
+      "Path to image for restore, replaces the initializing VM on success") \
+                                                                            \
+  product(uint, CRaCMinPid, 128,                                            \
+      "Mininal PID value for checkpoint'ed process")                        \
+      range(1, UINT_MAX)                                                    \
+                                                                            \
+  product(bool, CRaCResetStartTime, true, DIAGNOSTIC | RESTORE_SETTABLE,    \
+      "Reset JVM's start time and uptime on restore")                       \
+                                                                            \
+  product(ccstr, CREngine, "criuengine", RESTORE_SETTABLE,                  \
+      "Path or name of a program implementing checkpoint/restore and "      \
+      "optional extra parameters as a comma-separated list: "               \
+      "-XX:CREngine=program,--key,value,--anotherkey results in calling "   \
+      "'program --key value --anotherkey'. Commas used as part of args "    \
+      "should be escaped with a backslash character ('\\').")               \
+                                                                            \
+  product(bool, CRaCIgnoreRestoreIfUnavailable, false, RESTORE_SETTABLE,    \
+      "Ignore -XX:CRaCRestoreFrom and continue initialization if restore "  \
+      "is unavailable")                                                     \
+                                                                            \
+  product(ccstr, CRaCIgnoredFileDescriptors, NULL, RESTORE_SETTABLE,        \
+      "Comma-separated list of file descriptor numbers or paths. "          \
+      "All file descriptors greater than 2 (stdin, stdout and stderr are "  \
+      "excluded automatically) not in this list are closed when the VM "    \
+      "is started.")                                                        \
+                                                                            \
+  product_pd(ccstrlist, CRAllowedOpenFilePrefixes, "List of path prefixes " \
+      "for files that can be open during checkpoint; CRaC won't error "     \
+      "upon detecting these and will leave the handling up to C/R engine. " \
+      "This option applies only to files opened by native code; for files " \
+      "opened by Java code use -Djdk.crac.resource-policies=...")           \
+                                                                            \
+  product(bool, CRAllowToSkipCheckpoint, false, DIAGNOSTIC,                 \
+          "Allow implementation to not call Checkpoint if helper not found")\
+                                                                            \
+  product(bool, CRHeapDumpOnCheckpointException, false, DIAGNOSTIC,         \
+      "Dump heap on CheckpointException thrown because of CRaC "            \
+      "precondition failed")                                                \
+                                                                            \
+  product(bool, CRPrintResourcesOnCheckpoint, false, DIAGNOSTIC,            \
+      "Print resources to decide CheckpointException")                      \
+                                                                            \
+  product(bool, CRTraceStartupTime, false, DIAGNOSTIC,                      \
+      "Trace startup time")                                                 \
+                                                                            \
+  product(bool, CRDoThrowCheckpointException, true, EXPERIMENTAL,           \
+      "Throw CheckpointException if uncheckpointable resource handle found")\
+                                                                            \
+  product(bool, CRTrace, true, RESTORE_SETTABLE, "Minimal C/R tracing")     \
+                                                                            \
+  product(bool, CRPauseOnCheckpointError, false, DIAGNOSTIC,                \
+      "Pauses the checkpoint when a problem is found on VM level.")         \
+                                                                            \
                                                                             \
   product(int, LockingMode, LM_LEGACY, EXPERIMENTAL,                        \
           "Select locking mode: "                                           \

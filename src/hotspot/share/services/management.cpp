@@ -41,6 +41,7 @@
 #include "oops/oop.inline.hpp"
 #include "oops/oopHandle.inline.hpp"
 #include "oops/typeArrayOop.inline.hpp"
+#include "runtime/crac.hpp"
 #include "runtime/flags/jvmFlag.hpp"
 #include "runtime/globals.hpp"
 #include "runtime/handles.inline.hpp"
@@ -979,6 +980,18 @@ static jlong get_long_attribute(jmmLongAttribute att) {
 
   case JMM_OS_MEM_TOTAL_PHYSICAL_BYTES:
     return os::physical_memory();
+
+  case JMM_JVM_RESTORE_START_TIME_MS:
+    return crac::restore_start_time();
+
+  case JMM_JVM_UPTIME_SINCE_RESTORE_MS:
+    {
+      jlong ticks = crac::uptime_since_restore();
+      if (ticks == -1) {
+        return -1;
+      }
+      return Management::ticks_to_ms(ticks);
+    }
 
   default:
     return -1;

@@ -30,6 +30,7 @@ import java.io.InputStream;
 import java.io.IOException;
 import java.io.EOFException;
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.RandomAccessFile;
 import java.io.UncheckedIOException;
 import java.lang.ref.Cleaner.Cleanable;
@@ -63,6 +64,7 @@ import java.util.stream.StreamSupport;
 import jdk.internal.access.JavaUtilZipFileAccess;
 import jdk.internal.access.JavaUtilJarAccess;
 import jdk.internal.access.SharedSecrets;
+import jdk.internal.crac.Core;
 import jdk.internal.util.OperatingSystem;
 import jdk.internal.perf.PerfCounter;
 import jdk.internal.ref.CleanerFactory;
@@ -813,6 +815,15 @@ public class ZipFile implements ZipConstants, Closeable {
                 throw new UncheckedIOException(ioe);
             }
         }
+
+
+        public void beforeCheckpoint() {
+            if (zsrc != null) {
+                synchronized (zsrc) {
+                    zsrc.beforeCheckpoint();
+                }
+            }
+        }
     }
 
     /**
@@ -1093,6 +1104,10 @@ public class ZipFile implements ZipConstants, Closeable {
         }
     }
 
+    private synchronized void beforeCheckpoint() {
+        res.beforeCheckpoint();
+    }
+
     /**
      * Returns the value of the System property which indicates whether the
      * Extra ZIP64 validation should be disabled.
@@ -1153,7 +1168,11 @@ public class ZipFile implements ZipConstants, Closeable {
                     ze.extraAttributes = extraAttrs;
                 }
 
-             }
+                @Override
+                public void beforeCheckpoint(ZipFile zip) {
+                    zip.beforeCheckpoint();
+                }
+            }
         );
     }
 
@@ -1982,6 +2001,19 @@ public class ZipFile implements ZipConstants, Closeable {
                  p += CENHDR + CENNAM(cen, p) + CENEXT(cen, p) + CENCOM(cen, p))
                 count++;
             return count;
+        }
+
+        public void beforeCheckpoint() {
+            synchronized (zfile) {
+                FileDescriptor fd = null;
+                try {
+                    fd = zfile.getFD();
+                } catch (IOException e) {
+                }
+                if (fd != null) {
+                    Core.getClaimedFDs().claimFd(fd, this, () -> null, fd);
+                }
+            }
         }
     }
 }

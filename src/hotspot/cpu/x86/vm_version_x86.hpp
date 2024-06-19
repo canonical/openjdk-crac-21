@@ -26,6 +26,7 @@
 #define CPU_X86_VM_VERSION_X86_HPP
 
 #include "runtime/abstract_vm_version.hpp"
+#include "utilities/formatBuffer.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/sizes.hpp"
 
@@ -82,11 +83,12 @@ class VM_Version : public Abstract_VM_Version {
                dca      : 1,
                sse4_1   : 1,
                sse4_2   : 1,
-                        : 2,
+                        : 1,
+               movbe    : 1,
                popcnt   : 1,
                         : 1,
                aes      : 1,
-                        : 1,
+               xsave    : 1,
                osxsave  : 1,
                avx      : 1,
                f16c     : 1,
@@ -153,7 +155,9 @@ class VM_Version : public Abstract_VM_Version {
                sse4a        : 1,
                misalignsse  : 1,
                prefetchw    : 1,
-                            : 23;
+                            : 7,
+               fma4         : 1,
+                            : 15;
     } bits;
   };
 
@@ -395,9 +399,32 @@ protected:
 #define DECLARE_CPU_FEATURE_FLAG(id, name, bit) CPU_##id = (1ULL << bit),
     CPU_FEATURE_FLAGS(DECLARE_CPU_FEATURE_FLAG)
 #undef DECLARE_CPU_FEATURE_FLAG
+    MAX_CPU = CPU_AVX512_IFMA << 1
   };
 
+  /* Tracking of a CPU feature for glibc */ \
+  enum Glibc_Feature_Flag : uint64_t {
+#define GLIBC_FEATURE_FLAGS(decl) \
+    decl(FMA4,              "fma4",               0) \
+    decl(MOVBE,             "movbe",              1) \
+    decl(OSXSAVE,           "osxsave",            2) \
+    decl(XSAVE,             "xsave",              3) \
+    decl(CMPXCHG16,         "cmpxchg16",          4) /* Also known in cpuinfo as cx16 and in glibc as cmpxchg16b */ \
+    decl(LAHFSAHF,          "lahfsahf",           5) /* Also known in cpuinfo as lahf_lm and in glibc as lahf64_sahf64 */ \
+    decl(F16C,              "f16c",               6) \
+    decl(HTT,               "htt",                7) /* hotspot calls it 'ht' but it is affected by threads_per_core() */
+
+#define DECLARE_GLIBC_FEATURE_FLAG(id, name, bit) GLIBC_##id = (1ULL << bit),
+    GLIBC_FEATURE_FLAGS(DECLARE_GLIBC_FEATURE_FLAG)
+#undef DECLARE_GLIBC_FEATURE_FLAG
+    MAX_GLIBC = GLIBC_HTT << 1
+  };
+
+  // glibc feature flags.
+  static uint64_t _glibc_features;
+
   static const char* _features_names[];
+  static const char* _glibc_features_names[];
 
   enum Extended_Family {
     // AMD
@@ -522,30 +549,60 @@ protected:
 
     // Space to save zmm registers after signal handle
     int          zmm_save[16*4]; // Save zmm0, zmm7, zmm8, zmm31
+
+    uint64_t feature_flags() const;
+
+#ifdef LINUX
+    uint64_t glibc_flags() const {
+      uint64_t result = 0;
+      if (std_cpuid1_ecx.bits.movbe != 0)
+        result |= GLIBC_MOVBE;
+      if (std_cpuid1_ecx.bits.osxsave != 0)
+        result |= GLIBC_OSXSAVE;
+      if (std_cpuid1_ecx.bits.xsave != 0)
+        result |= GLIBC_XSAVE;
+      if (std_cpuid1_ecx.bits.cmpxchg16 != 0)
+        result |= GLIBC_CMPXCHG16;
+      if (std_cpuid1_ecx.bits.f16c != 0)
+        result |= GLIBC_F16C;
+      if (ext_cpuid1_ecx.bits.fma4 != 0)
+        result |= GLIBC_FMA4;
+      if (ext_cpuid1_ecx.bits.LahfSahf != 0)
+        result |= GLIBC_LAHFSAHF;
+      if (std_cpuid1_edx.bits.ht != 0)
+        result |= GLIBC_HTT;
+      return result;
+    }
+#endif //LINUX
+
+    void assert_is_initialized() const {
+      assert(std_cpuid1_eax.bits.family != 0, "VM_Version not initialized");
+    }
+
+    // Extractors
+    uint32_t extended_cpu_family() const {
+      uint32_t result = std_cpuid1_eax.bits.family;
+      result += std_cpuid1_eax.bits.ext_family;
+      return result;
+    }
+
+    uint32_t extended_cpu_model() const {
+      uint32_t result = std_cpuid1_eax.bits.model;
+      result |= std_cpuid1_eax.bits.ext_model << 4;
+      return result;
+    }
+
+    uint32_t cpu_stepping() const {
+      uint32_t result = std_cpuid1_eax.bits.stepping;
+      return result;
+    }
   };
 
 private:
   // The actual cpuid info block
   static CpuidInfo _cpuid_info;
 
-  // Extractors and predicates
-  static uint32_t extended_cpu_family() {
-    uint32_t result = _cpuid_info.std_cpuid1_eax.bits.family;
-    result += _cpuid_info.std_cpuid1_eax.bits.ext_family;
-    return result;
-  }
-
-  static uint32_t extended_cpu_model() {
-    uint32_t result = _cpuid_info.std_cpuid1_eax.bits.model;
-    result |= _cpuid_info.std_cpuid1_eax.bits.ext_model << 4;
-    return result;
-  }
-
-  static uint32_t cpu_stepping() {
-    uint32_t result = _cpuid_info.std_cpuid1_eax.bits.stepping;
-    return result;
-  }
-
+  // Extractor
   static uint logical_processor_count() {
     uint result = threads_per_core();
     return result;
@@ -553,7 +610,26 @@ private:
 
   static bool compute_has_intel_jcc_erratum();
 
-  static uint64_t feature_flags();
+  static void get_processor_features_hardware();
+  static void get_processor_features_hotspot();
+
+  static uint64_t CPUFeatures_parse(uint64_t &glibc_features);
+#ifdef LINUX
+  static void glibc_not_using(uint64_t excessive_CPU, uint64_t excessive_GLIBC);
+  static bool glibc_env_set(char *disable_str);
+  /*[[noreturn]]*/ static void glibc_reexec();
+  // C++17: Make glibc_prefix and glibc_prefix_len constexpr.
+  static const char glibc_prefix[];
+  static const size_t glibc_prefix_len;
+#endif //LINUX
+  // C++17: Make _ignore_glibc_not_using inline.
+  static bool _ignore_glibc_not_using;
+  static bool _crac_restore_missing_features;
+  static void nonlibc_tty_print_uint64(uint64_t num);
+  static void nonlibc_tty_print_uint64_comma_uint64(uint64_t num1, uint64_t num2);
+  static void print_using_features_cr();
+  /*[[noreturn]]*/ static void missing_features(uint64_t features_missing, uint64_t glibc_features_missing);
+
   static bool os_supports_avx_vectors();
   static void get_processor_features();
 
@@ -588,15 +664,36 @@ public:
   static void set_avx_cpuFeatures() { _features = (CPU_SSE | CPU_SSE2 | CPU_AVX | CPU_VZEROUPPER ); }
   static void set_evex_cpuFeatures() { _features = (CPU_AVX512F | CPU_SSE | CPU_SSE2 | CPU_VZEROUPPER ); }
 
+  static void insert_features_names(char* buf, size_t buflen, uint64_t features = _features) {
+    Abstract_VM_Version::insert_features_names(buf, buflen, _features_names, features);
+  }
+  static void insert_glibc_features_names(char* buf, size_t buflen, uint64_t glibc_features) {
+    Abstract_VM_Version::insert_features_names(buf, buflen, _glibc_features_names, glibc_features);
+  }
+
   // Initialization
   static void initialize();
+  static void crac_restore();
+  static void crac_restore_finalize();
 
   // Override Abstract_VM_Version implementation
   static void print_platform_virtualization_info(outputStream*);
 
   // Asserts
   static void assert_is_initialized() {
-    assert(_cpuid_info.std_cpuid1_eax.bits.family != 0, "VM_Version not initialized");
+    _cpuid_info.assert_is_initialized();
+  }
+
+  static uint32_t extended_cpu_family() {
+    return _cpuid_info.extended_cpu_family();
+  }
+
+  static uint32_t extended_cpu_model() {
+    return _cpuid_info.extended_cpu_model();
+  }
+
+  static uint32_t cpu_stepping() {
+    return _cpuid_info.cpu_stepping();
   }
 
   //

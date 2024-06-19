@@ -38,17 +38,23 @@
 #include "runtime/os.inline.hpp"
 #include "runtime/stubCodeGenerator.hpp"
 #include "runtime/vm_version.hpp"
+#include "utilities/formatBuffer.hpp"
 #include "utilities/powerOfTwo.hpp"
 #include "utilities/virtualizationSupport.hpp"
+#if INCLUDE_CPU_FEATURE_ACTIVE
+# include <sys/platform/x86.h>
+#endif
 
 int VM_Version::_cpu;
 int VM_Version::_model;
 int VM_Version::_stepping;
 bool VM_Version::_has_intel_jcc_erratum;
 VM_Version::CpuidInfo VM_Version::_cpuid_info = { 0, };
+uint64_t VM_Version::_glibc_features;
 
 #define DECLARE_CPU_FEATURE_NAME(id, name, bit) name,
-const char* VM_Version::_features_names[] = { CPU_FEATURE_FLAGS(DECLARE_CPU_FEATURE_NAME)};
+const char* VM_Version::      _features_names[] = {   CPU_FEATURE_FLAGS(DECLARE_CPU_FEATURE_NAME)};
+const char* VM_Version::_glibc_features_names[] = { GLIBC_FEATURE_FLAGS(DECLARE_CPU_FEATURE_NAME)};
 #undef DECLARE_CPU_FEATURE_FLAG
 
 // Address of instruction which causes SEGV
@@ -78,8 +84,17 @@ bool VM_Version::supports_clflush() {
   // up. Assembler::flush calls this routine to check that clflush
   // is allowed. So, we give the caller a free pass if Universe init
   // is still in progress.
-  assert ((!Universe::is_fully_initialized() || (_features & CPU_FLUSH) != 0), "clflush should be available");
-  return true;
+  if (!Universe::is_fully_initialized()) {
+    return true;
+  }
+  if ((_features & CPU_FLUSH) != 0) {
+    return true;
+  }
+  if (FLAG_IS_DEFAULT(CPUFeatures)) {
+    vm_exit_during_initialization("clflush should be available");
+  }
+  vm_exit_during_initialization(err_msg("-XX:CPUFeatures option requires FLUSH flag to be set: " UINT64_FORMAT_X, CPU_FLUSH));
+  return false;
 }
 #endif
 
@@ -788,12 +803,459 @@ class VM_Version_StubGenerator: public StubCodeGenerator {
   };
 };
 
-void VM_Version::get_processor_features() {
+uint64_t VM_Version::CPUFeatures_parse(uint64_t &glibc_features) {
+  glibc_features = _glibc_features;
+#ifndef LINUX
+  _ignore_glibc_not_using = true;
+  return _features;
+#endif
+  if (CPUFeatures == NULL || strcmp(CPUFeatures, "native") == 0) {
+    return _features;
+  }
+  if (strcmp(CPUFeatures, "ignore") == 0) {
+    _ignore_glibc_not_using = true;
+    return _features;
+  }
+  glibc_features = 0;
+  if (strcmp(CPUFeatures, "generic") == 0) {
+    // 32-bit x86 cannot rely on anything.
+    return 0
+#ifdef AMD64
+      // The following options are all in /proc/cpuinfo of one of the first 64-bit CPUs - Atom D2700 (and Opteron 1352): https://superuser.com/q/1572306/1015048
+      | CPU_SSE // enabled in 'gcc -Q --help=target', used by OpenJDK
+      | CPU_SSE2 // enabled in 'gcc -Q --help=target', required by OpenJDK
+      | CPU_FXSR // enabled in 'gcc -Q --help=target', not used by OpenJDK
+      | CPU_MMX // enabled in 'gcc -Q --help=target', used only by 32-bit x86 OpenJDK
+      | CPU_TSC // not used by gcc, used by OpenJDK
+      | CPU_CX8 // gcc detects it to set cpu "pentium" (=32-bit only), used by OpenJDK
+      | CPU_CMOV // gcc detects it to set cpu "pentiumpro" (=32-bit only), used by OpenJDK
+      | CPU_FLUSH // ="clflush" in cpuinfo, not used by gcc, required by OpenJDK
+      // GLIBC_MOVBE is disabled in 'gcc -Q --help=target' and some CPUs do not support it: https://stackoverflow.com/a/5246553/2995591
+      // GLIBC_LAHFSAHF is disabled in 'gcc -Q --help=target' and "Early Intel Pentium 4 CPUs with Intel 64 support ... lacked the LAHF and SAHF instructions"
+#endif
+    ;
+  }
+  char *endptr;
+  errno = 0;
+  uint64_t retval;
+  unsigned long long ull = strtoull(CPUFeatures, &endptr, 0);
+  retval = ull;
+  if (!errno && *endptr == ',' && retval == ull) {
+    ull = strtoull(endptr + 1, &endptr, 0);
+    glibc_features = ull;
+    if (!errno && !*endptr && glibc_features == ull) {
+      return retval;
+    }
+  }
+  vm_exit_during_initialization(err_msg("VM option 'CPUFeatures=%s' must be of the form: 0xnum,0xnum", CPUFeatures));
+  return -1;
+}
 
+bool VM_Version::_ignore_glibc_not_using = false;
+bool VM_Version::_crac_restore_missing_features;
+#ifdef LINUX
+const char VM_Version::glibc_prefix[] = ":glibc.cpu.hwcaps=";
+const size_t VM_Version::glibc_prefix_len = strlen(glibc_prefix);
+
+bool VM_Version::glibc_env_set(char *disable_str) {
+#define TUNABLES_NAME "GLIBC_TUNABLES"
+  char *env_val = disable_str;
+  const char *env = getenv(TUNABLES_NAME);
+  if (env && strcmp(env, env_val) == 0) {
+    if (!INCLUDE_CPU_FEATURE_ACTIVE) {
+      if (ShowCPUFeatures) {
+        tty->print_cr("Environment variable already set, glibc CPU_FEATURE_ACTIVE is unavailable - re-exec suppressed: " TUNABLES_NAME "=%s", env);
+      }
+      return true;
+    }
+  }
+  char env_buf[strlen(disable_str) + (!env ? 0 : strlen(env) + 100)];
+  if (env) {
+    if (ShowCPUFeatures) {
+      tty->print_cr("Original environment variable: " TUNABLES_NAME "=%s", env);
+    }
+    const char *hwcaps = strstr(env, glibc_prefix + 1 /* skip ':' */);
+    if (!hwcaps) {
+      strcpy(env_buf, env);
+      strcat(env_buf, disable_str);
+    } else {
+      const char *colon = strchr(hwcaps, ':');
+      if (!colon) {
+        strcpy(env_buf, env);
+        strcat(env_buf, disable_str + glibc_prefix_len);
+      } else {
+        int err = jio_snprintf(env_buf, sizeof(env_buf), "%.*s%s%s", (int)(colon - env), env, disable_str + glibc_prefix_len, colon);
+        assert(err >= 0 && (unsigned)err < sizeof(env_buf), "internal error: " TUNABLES_NAME " buffer overflow");
+      }
+    }
+    env_val = env_buf;
+  }
+  if (ShowCPUFeatures) {
+    tty->print_cr("Re-exec of java with new environment variable: " TUNABLES_NAME "=%s", env_val);
+  }
+  int err = setenv(TUNABLES_NAME, env_val, 1);
+  if (err)
+    vm_exit_during_initialization(err_msg("setenv " TUNABLES_NAME " error: %m"));
+
+#define REEXEC_NAME "HOTSPOT_GLIBC_TUNABLES_REEXEC"
+  if (getenv(REEXEC_NAME))
+    vm_exit_during_initialization(err_msg("internal error: " TUNABLES_NAME "=%s failed and " REEXEC_NAME " is set", disable_str));
+  if (setenv(REEXEC_NAME, "1", 1))
+    vm_exit_during_initialization(err_msg("setenv " REEXEC_NAME " error: %m"));
+#undef REEXEC_NAME
+#undef TUNABLES_NAME
+  return false;
+}
+
+void VM_Version::glibc_reexec() {
+  char *buf = NULL;
+  size_t buf_allocated = 0;
+  size_t buf_used = 0;
+#define CMDLINE "/proc/self/cmdline"
+  int fd = open(CMDLINE, O_RDONLY);
+  if (fd == -1)
+    vm_exit_during_initialization(err_msg("Cannot open " CMDLINE ": %m"));
+  ssize_t got;
+  do {
+    if (buf_used == buf_allocated) {
+      buf_allocated = MAX2(size_t(4096), 2 * buf_allocated);
+      buf = (char *)os::realloc(buf, buf_allocated, mtOther);
+      if (buf == NULL)
+        vm_exit_during_initialization(err_msg(CMDLINE " reading failed allocating %zu bytes", buf_allocated));
+    }
+    got = read(fd, buf + buf_used, buf_allocated - buf_used);
+    if (got == -1)
+      vm_exit_during_initialization(err_msg("Cannot read " CMDLINE ": %m"));
+    buf_used += got;
+  } while (got);
+  if (close(fd))
+    vm_exit_during_initialization(err_msg("Cannot close " CMDLINE ": %m"));
+  char **argv = NULL;
+  size_t argv_allocated = 0;
+  size_t argv_used = 0;
+  char *s = buf;
+  while (s <= buf + buf_used) {
+    if (argv_used == argv_allocated) {
+      argv_allocated = MAX2(size_t(256), 2 * argv_allocated);
+      argv = (char **)os::realloc(argv, argv_allocated * sizeof(*argv), mtOther);
+      if (argv == NULL)
+        vm_exit_during_initialization(err_msg(CMDLINE " reading failed allocating %zu pointers", argv_allocated));
+    }
+    if (s == buf + buf_used) {
+      break;
+    }
+    argv[argv_used++] = s;
+    s += strnlen(s, buf + buf_used - s);
+    if (s == buf + buf_used)
+      vm_exit_during_initialization("Missing end of string zero while parsing " CMDLINE);
+    ++s;
+  }
+  argv[argv_used] = NULL;
+#undef CMDLINE
+
+#define EXEC "/proc/self/exe"
+  execv(EXEC, argv);
+  vm_exit_during_initialization(err_msg("Cannot re-execute " EXEC ": %m"));
+#undef EXEC
+}
+
+void VM_Version::glibc_not_using(uint64_t excessive_CPU, uint64_t excessive_GLIBC) {
+#ifndef ASSERT
+  if (!excessive_CPU && !excessive_GLIBC)
+    return;
+#endif
+
+  // glibc: sysdeps/x86/get-isa-level.h:
+  // glibc: if (CPU_FEATURE_USABLE_P (cpu_features, CMOV)
+  // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, CX8)
+  // glibc:     && CPU_FEATURE_CPU_P (cpu_features, FPU)
+  // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, FXSR)
+  // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, MMX)
+  // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, SSE)
+  // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, SSE2))
+  // glibc:     isa_level = GNU_PROPERTY_X86_ISA_1_BASELINE;
+  if ((_features & CPU_CMOV) &&
+      (_features & CPU_CX8) &&
+      // FPU is always present on i686+: (_features & CPU_FPU) &&
+      (_features & CPU_SSE2)) {
+    // These cannot be disabled by GLIBC_TUNABLES.
+    if (excessive_CPU & (CPU_FXSR | CPU_MMX | CPU_SSE)) {
+      assert(!(excessive_CPU & CPU_SSE2), "CPU_SSE2 in both _features and excessive_CPU cannot happen");
+      // FIXME: The choice should be based on glibc impact, not the feature age.
+      // CX8 is i586+, CMOV is i686+ 1995+, SSE2 is 2000+
+      excessive_CPU |= CPU_SSE2;
+    }
+    if ((_features & CPU_FXSR) &&
+        (_features & CPU_MMX) &&
+        (_features & CPU_SSE)) {
+      // glibc: if (CPU_FEATURE_USABLE_P (cpu_features, CMPXCHG16B)
+      // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, LAHF64_SAHF64)
+      // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, POPCNT)
+      // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, SSE3)
+      // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, SSSE3)
+      // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, SSE4_1)
+      // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, SSE4_2))
+      // glibc:     isa_level |= GNU_PROPERTY_X86_ISA_1_V2;
+      if ((_features & CPU_POPCNT) &&
+          (_features & CPU_SSSE3) &&
+          (_features & CPU_SSE4_1) &&
+          (_features & CPU_SSE4_2)) {
+        if ((excessive_CPU & CPU_SSE3) ||
+            (excessive_GLIBC & (GLIBC_CMPXCHG16 | GLIBC_LAHFSAHF))) {
+          assert(!(excessive_CPU & CPU_SSE4_2), "CPU_SSE4_2 in both _features and excessive_CPU cannot happen");
+          // POPCNT is 2007+, SSSE3 is 2006+, SSE4_1 is 2007+, SSE4_2 is 2008+.
+          excessive_CPU |= CPU_SSE4_2;
+        }
+        if ((_features & CPU_SSE3) &&
+            (_glibc_features & GLIBC_CMPXCHG16) &&
+            (_glibc_features & GLIBC_LAHFSAHF)) {
+          // glibc: if (CPU_FEATURE_USABLE_P (cpu_features, AVX)
+          // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, AVX2)
+          // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, BMI1)
+          // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, BMI2)
+          // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, F16C)
+          // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, FMA)
+          // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, LZCNT)
+          // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, MOVBE))
+          // glibc:     isa_level |= GNU_PROPERTY_X86_ISA_1_V3;
+          if ((_features & CPU_AVX) &&
+              (_features & CPU_AVX2) &&
+              (_features & CPU_BMI1) &&
+              (_features & CPU_BMI2) &&
+              (_features & CPU_FMA) &&
+              (_features & CPU_LZCNT) &&
+              (_glibc_features & GLIBC_MOVBE)) {
+            if (excessive_GLIBC & GLIBC_F16C) {
+              assert(!(excessive_GLIBC & GLIBC_MOVBE), "GLIBC_MOVBE in both _glibc_features and excessive_GLIBC cannot happen");
+              // FMA is 2012+, AVX2+BMI1+BMI2+LZCNT are 2013+, MOVBE is 2015+
+              excessive_GLIBC |= GLIBC_MOVBE;
+            }
+            if (_glibc_features & GLIBC_F16C) {
+              // glibc: if (CPU_FEATURE_USABLE_P (cpu_features, AVX512F)
+              // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, AVX512BW)
+              // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, AVX512CD)
+              // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, AVX512DQ)
+              // glibc:     && CPU_FEATURE_USABLE_P (cpu_features, AVX512VL))
+              // glibc:   isa_level |= GNU_PROPERTY_X86_ISA_1_V4;
+              // All these flags are supported by GLIBC_DISABLE below.
+            }
+          }
+        }
+      }
+    }
+  }
+  uint64_t disable_CPU   = 0;
+  uint64_t disable_GLIBC = 0;
+#define PASTE_TOKENS3(x, y, z) PASTE_TOKENS(x, PASTE_TOKENS(y, z))
+#ifdef ASSERT
+  uint64_t excessive_handled_CPU   = 0;
+  uint64_t excessive_handled_GLIBC = 0;
+  uint64_t disable_handled_CPU   = 0;
+  uint64_t disable_handled_GLIBC = 0;
+#endif
+#define EXCESSIVE_HANDLED(kind, hotspot) do {                                                                                         \
+    assert(!(PASTE_TOKENS(excessive_handled_, kind) & PASTE_TOKENS3(kind, _, hotspot)), "already used " STR(kind) "_" STR(hotspot) ); \
+    DEBUG_ONLY(PASTE_TOKENS(excessive_handled_, kind) |= PASTE_TOKENS3(kind, _, hotspot));                                            \
+  } while (0)
+#if INCLUDE_CPU_FEATURE_ACTIVE
+# define FEATURE_ACTIVE(glibc) CPU_FEATURE_ACTIVE(glibc)
+#else
+# define FEATURE_ACTIVE(glibc) true
+#endif
+#define EXCESSIVE3(kind, hotspot, glibc) do {                                                        \
+    EXCESSIVE_HANDLED(kind, hotspot);                                                                \
+    if (PASTE_TOKENS(excessive_, kind) & PASTE_TOKENS3(kind, _, hotspot) && FEATURE_ACTIVE(glibc)) { \
+      PASTE_TOKENS(disable_, kind) |= PASTE_TOKENS3(kind, _, hotspot);                               \
+    }                                                                                                \
+  } while (0)
+#define EXCESSIVE(kind, hotspotglibc) EXCESSIVE3(kind, hotspotglibc, hotspotglibc)
+  EXCESSIVE(CPU  , AVX     );
+  EXCESSIVE(CPU  , CX8     );
+  EXCESSIVE(CPU  , FMA     );
+  EXCESSIVE(CPU  , RTM     );
+  EXCESSIVE(CPU  , AVX2    );
+  EXCESSIVE(CPU  , BMI1    );
+  EXCESSIVE(CPU  , BMI2    );
+  EXCESSIVE(CPU  , CMOV    );
+  EXCESSIVE(CPU  , ERMS    );
+  EXCESSIVE(CPU  , SSE2    );
+  EXCESSIVE(CPU  , LZCNT   );
+  EXCESSIVE(CPU  , SSSE3   );
+  EXCESSIVE(CPU  , POPCNT  );
+  EXCESSIVE(CPU  , SSE4_1  );
+  EXCESSIVE(CPU  , SSE4_2  );
+  EXCESSIVE(CPU  , AVX512F );
+  EXCESSIVE(CPU  , AVX512CD);
+  EXCESSIVE(CPU  , AVX512BW);
+  EXCESSIVE(CPU  , AVX512DQ);
+  EXCESSIVE(CPU  , AVX512ER);
+  EXCESSIVE(CPU  , AVX512PF);
+  EXCESSIVE(CPU  , AVX512VL);
+  EXCESSIVE3(CPU , CET_IBT , IBT  );
+  EXCESSIVE3(CPU , CET_SS  , SHSTK);
+  EXCESSIVE(GLIBC, FMA4    );
+  EXCESSIVE(GLIBC, MOVBE   );
+  EXCESSIVE(GLIBC, XSAVE   );
+  EXCESSIVE(GLIBC, OSXSAVE );
+  EXCESSIVE(GLIBC, HTT     );
+#undef EXCESSIVE
+#undef EXCESSIVE3
+
+  char disable_str[64 * (10 + 3) + 1];
+  strcpy(disable_str, glibc_prefix);
+  char *disable_end = disable_str + glibc_prefix_len;
+#define GLIBC_DISABLE2(kind, hotspot, glibc) do {                                                                                   \
+    assert(!(PASTE_TOKENS(disable_handled_, kind) & PASTE_TOKENS3(kind, _, hotspot)), "already used " STR(kind) "_" STR(hotspot) ); \
+    DEBUG_ONLY(PASTE_TOKENS(disable_handled_, kind) |= PASTE_TOKENS3(kind, _, hotspot));                                            \
+    if (PASTE_TOKENS(disable_, kind) & PASTE_TOKENS3(kind, _, hotspot)) {                                                           \
+      const char str[] = ",-" STR(glibc);                                                                                           \
+      size_t remains = disable_str + sizeof(disable_str) - disable_end;                                                             \
+      strncpy(disable_end, str, remains);                                                                                           \
+      size_t len = strnlen(disable_end, remains);                                                                                   \
+      remains -= len;                                                                                                               \
+      assert(remains > 0, "internal error: disable_str overflow");                                                                  \
+      disable_end += len;                                                                                                           \
+    }                                                                                                                               \
+  } while (0);
+#define GLIBC_DISABLE(kind, hotspot_glibc) GLIBC_DISABLE2(kind, hotspot_glibc, hotspot_glibc)
+  GLIBC_DISABLE(CPU  , AVX)
+  GLIBC_DISABLE(CPU  , CX8)
+  GLIBC_DISABLE(CPU  , FMA)
+  GLIBC_DISABLE(CPU  , RTM)
+  GLIBC_DISABLE(CPU  , AVX2)
+  GLIBC_DISABLE(CPU  , BMI1)
+  GLIBC_DISABLE(CPU  , BMI2)
+  GLIBC_DISABLE(CPU  , CMOV)
+  GLIBC_DISABLE(CPU  , ERMS)
+  GLIBC_DISABLE(CPU  , SSE2)
+  GLIBC_DISABLE(CPU  , LZCNT)
+  GLIBC_DISABLE(CPU  , SSSE3)
+  GLIBC_DISABLE(CPU  , POPCNT)
+  GLIBC_DISABLE(CPU  , SSE4_1)
+  GLIBC_DISABLE(CPU  , SSE4_2)
+  GLIBC_DISABLE(CPU  , AVX512F)
+  GLIBC_DISABLE(CPU  , AVX512CD)
+  GLIBC_DISABLE(CPU  , AVX512BW)
+  GLIBC_DISABLE(CPU  , AVX512DQ)
+  GLIBC_DISABLE(CPU  , AVX512ER)
+  GLIBC_DISABLE(CPU  , AVX512PF)
+  GLIBC_DISABLE(CPU  , AVX512VL)
+  GLIBC_DISABLE2(CPU , CET_IBT, IBT)
+  GLIBC_DISABLE2(CPU , CET_SS , SHSTK)
+  GLIBC_DISABLE(GLIBC, FMA4)
+  GLIBC_DISABLE(GLIBC, MOVBE)
+  GLIBC_DISABLE(GLIBC, XSAVE)
+  GLIBC_DISABLE(GLIBC, OSXSAVE)
+  GLIBC_DISABLE(GLIBC, HTT)
+#undef GLIBC_DISABLE
+#undef GLIBC_DISABLE2
+  *disable_end = 0;
+
+#ifdef ASSERT
+#define CHECK_KIND(kind) do {                                                                                                            \
+    if (PASTE_TOKENS(disable_handled_, kind) != PASTE_TOKENS(excessive_handled_, kind))                                                  \
+      vm_exit_during_initialization(err_msg("internal error: Unsupported disabling of " STR(kind) "_* 0x%" PRIx64 " != used 0x%" PRIx64, \
+                                            PASTE_TOKENS(disable_handled_, kind), PASTE_TOKENS(excessive_handled_, kind)));              \
+  } while (0)
+  CHECK_KIND(CPU  );
+  CHECK_KIND(GLIBC);
+#undef CHECK_KIND
+
+  // These cannot be disabled by GLIBC_TUNABLES interface.
+#define GLIBC_UNSUPPORTED(kind, hotspot) EXCESSIVE_HANDLED(kind, hotspot)
+  GLIBC_UNSUPPORTED(CPU  , 3DNOW_PREFETCH   );
+  GLIBC_UNSUPPORTED(CPU  , SSE4A            );
+  GLIBC_UNSUPPORTED(CPU  , TSC              );
+  GLIBC_UNSUPPORTED(CPU  , TSCINV_BIT       );
+  GLIBC_UNSUPPORTED(CPU  , TSCINV           );
+  GLIBC_UNSUPPORTED(CPU  , AES              );
+  GLIBC_UNSUPPORTED(CPU  , CLMUL            );
+  GLIBC_UNSUPPORTED(CPU  , ADX              );
+  GLIBC_UNSUPPORTED(CPU  , SHA              );
+  GLIBC_UNSUPPORTED(CPU  , VZEROUPPER       );
+  GLIBC_UNSUPPORTED(CPU  , AVX512_VPOPCNTDQ );
+  GLIBC_UNSUPPORTED(CPU  , AVX512_VPCLMULQDQ);
+  GLIBC_UNSUPPORTED(CPU  , AVX512_VAES      );
+  GLIBC_UNSUPPORTED(CPU  , AVX512_VNNI      );
+  GLIBC_UNSUPPORTED(CPU  , FLUSH            );
+  GLIBC_UNSUPPORTED(CPU  , FLUSHOPT         );
+  GLIBC_UNSUPPORTED(CPU  , CLWB             );
+  GLIBC_UNSUPPORTED(CPU  , AVX512_VBMI2     );
+  GLIBC_UNSUPPORTED(CPU  , AVX512_VBMI      );
+  GLIBC_UNSUPPORTED(CPU  , HV               );
+  GLIBC_UNSUPPORTED(CPU  , SSE3             );
+  GLIBC_UNSUPPORTED(CPU  , SERIALIZE        );
+  GLIBC_UNSUPPORTED(CPU  , RDTSCP           );
+  GLIBC_UNSUPPORTED(CPU  , RDPID            );
+  GLIBC_UNSUPPORTED(CPU  , FSRM             );
+  GLIBC_UNSUPPORTED(CPU  , GFNI             );
+  GLIBC_UNSUPPORTED(CPU  , AVX512_BITALG    );
+  GLIBC_UNSUPPORTED(CPU  , F16C             );
+  GLIBC_UNSUPPORTED(CPU  , PKU              );
+  GLIBC_UNSUPPORTED(CPU  , OSPKE            );
+  GLIBC_UNSUPPORTED(CPU  , AVX512_IFMA      );
+  // These are handled as an exception above.
+  GLIBC_UNSUPPORTED(CPU  , FXSR             );
+  GLIBC_UNSUPPORTED(CPU  , MMX              );
+  GLIBC_UNSUPPORTED(CPU  , SSE              );
+  GLIBC_UNSUPPORTED(CPU  , HT               );
+  GLIBC_UNSUPPORTED(GLIBC, CMPXCHG16        );
+  GLIBC_UNSUPPORTED(GLIBC, LAHFSAHF         );
+  GLIBC_UNSUPPORTED(GLIBC, F16C             );
+#undef GLIBC_UNSUPPORTED
+#define CHECK_KIND(kind) do {                                                                                                                 \
+    if (PASTE_TOKENS(excessive_handled_, kind) != PASTE_TOKENS(MAX_, kind) - 1)                                                               \
+      vm_exit_during_initialization(err_msg("internal error: Unsupported disabling of some " STR(kind) "_* 0x%" PRIx64 " != full 0x%" PRIx64, \
+                                            PASTE_TOKENS(excessive_handled_, kind), PASTE_TOKENS(MAX_, kind) - 1));                           \
+  } while (0)
+  CHECK_KIND(CPU  );
+  CHECK_KIND(GLIBC);
+#undef CHECK_KIND
+#endif // ASSERT
+
+  if (disable_end == disable_str + glibc_prefix_len)
+    return;
+  if (glibc_env_set(disable_str))
+    return;
+  glibc_reexec();
+}
+#endif //LINUX
+
+void VM_Version::nonlibc_tty_print_uint64(uint64_t num) {
+  static const char prefix[] = "0x";
+  tty->write(prefix, sizeof(prefix) - 1);
+  bool first = true;
+  for (int pos = 64 - 4; pos >= 0; pos -= 4) {
+    unsigned nibble = (num >> pos) & 0xf;
+    if (first && nibble == 0 && pos)
+      continue;
+    first = false;
+    char c = nibble >= 0xa ? 'a' + nibble - 0xa : '0' + nibble;
+    tty->write(&c, sizeof(c));
+  }
+}
+
+void VM_Version::nonlibc_tty_print_uint64_comma_uint64(uint64_t num1, uint64_t num2) {
+  nonlibc_tty_print_uint64(num1);
+  static const char comma = ',';
+  tty->print_raw(&comma, sizeof(comma));
+  nonlibc_tty_print_uint64(num2);
+}
+
+void VM_Version::print_using_features_cr() {
+  if (_ignore_glibc_not_using) {
+    tty->print_cr("CPU features are being kept intact as requested by -XX:CPUFeatures=ignore");
+  } else {
+    tty->print_cr("CPU features being used are: -XX:CPUFeatures=" UINT64_FORMAT_X "," UINT64_FORMAT_X, _features, _glibc_features);
+  }
+}
+
+void VM_Version::get_processor_features_hardware() {
   _cpu = 4; // 486 by default
   _model = 0;
   _stepping = 0;
   _features = 0;
+  _glibc_features = 0;
   _logical_processors_per_package = 1;
   // i486 internal cache is both I&D and has a 16-byte line size
   _L1_data_cache_line_size = 16;
@@ -808,7 +1270,8 @@ void VM_Version::get_processor_features() {
   _stepping = cpu_stepping();
 
   if (cpu_family() > 4) { // it supports CPUID
-    _features = feature_flags();
+    _features = _cpuid_info.feature_flags();
+    LINUX_ONLY(_glibc_features = _cpuid_info.glibc_flags();)
     // Logical processors are only available on P4s and above,
     // and only if hyperthreading is available.
     _logical_processors_per_package = logical_processor_count();
@@ -822,9 +1285,21 @@ void VM_Version::get_processor_features() {
   LP64_ONLY(_supports_atomic_getset8 = true);
   LP64_ONLY(_supports_atomic_getadd8 = true);
 
+  if (ShowCPUFeatures) {
+    static const char prefix[] = "This machine's CPU features are: -XX:CPUFeatures=";
+    tty->print_raw(prefix, sizeof(prefix) - 1);
+    nonlibc_tty_print_uint64_comma_uint64(_features, _glibc_features);
+    tty->cr();
+  }
+}
+
+void VM_Version::get_processor_features_hotspot() {
+
 #ifdef _LP64
   // OS should support SSE for x64 and hardware should support at least SSE2.
   if (!VM_Version::supports_sse2()) {
+    if (!FLAG_IS_DEFAULT(CPUFeatures))
+      vm_exit_during_initialization(err_msg("-XX:CPUFeatures option requires SSE2 flag to be set: " UINT64_FORMAT_X "," UINT64_FORMAT_X, CPU_SSE2, (uint64_t)0));
     vm_exit_during_initialization("Unknown x64 processor: SSE2 not supported");
   }
   // in 64 bit the use of SSE2 is the minimum
@@ -998,7 +1473,7 @@ void VM_Version::get_processor_features() {
               cores_per_cpu(), threads_per_core(),
               cpu_family(), _model, _stepping, os::cpu_microcode_revision());
   assert(res > 0, "not enough temporary space allocated");
-  insert_features_names(buf + res, sizeof(buf) - res, _features_names);
+  insert_features_names(buf + res, sizeof(buf) - res);
 
   _features_string = os::strdup(buf);
 
@@ -2081,6 +2556,78 @@ void VM_Version::check_virtualizations() {
   }
 }
 
+// Print the feature names as " = feat1, ..., featN\n";
+void VM_Version::missing_features(uint64_t features_missing, uint64_t glibc_features_missing) {
+  static const char part1[] = "; missing features of this CPU are ";
+  tty->print_raw(part1, sizeof(part1) - 1);
+  nonlibc_tty_print_uint64_comma_uint64(features_missing, glibc_features_missing);
+  static const char part2[] = " =";
+  tty->print_raw(part2, sizeof(part2) - 1);
+  char buf[512] = "";
+  // insert_features_names() does crash for undefined too high-numbered features.
+  insert_features_names(buf, sizeof(buf)          ,       features_missing & (  MAX_CPU - 1));
+  char *s = buf;
+  while (*s)
+    ++s;
+  insert_features_names(s  , buf + sizeof(buf) - s, glibc_features_missing & (MAX_GLIBC - 1));
+  while (*s)
+    ++s;
+  /* +1 to skip the first ','. */
+  tty->print_raw(buf + 1, s - (buf + 1));
+  tty->cr();
+  static const char line2[] = "If you are sure it will not crash you can override this check by -XX:+UnlockExperimentalVMOptions -XX:+IgnoreCPUFeatures .";
+  tty->print_raw(line2, sizeof(line2) - 1);
+  tty->cr();
+}
+
+void VM_Version::crac_restore() {
+  assert(CRaCCheckpointTo != NULL, "");
+
+  if (ShowCPUFeatures) {
+    static const char prefix[] = "This snapshot's stored CPU features are: -XX:CPUFeatures=";
+    tty->print_raw(prefix, sizeof(prefix) - 1);
+    nonlibc_tty_print_uint64_comma_uint64(_features, _glibc_features);
+    tty->cr();
+  }
+
+  VM_Version::CpuidInfo cpuid_info = { 0, };
+  get_cpu_info_stub(&cpuid_info);
+  cpuid_info.assert_is_initialized();
+
+  uint64_t       new_cpu_features = 0;
+  uint64_t new_cpu_glibc_features = 0;
+  if (cpuid_info.extended_cpu_family() > 4) { // it supports CPUID
+    new_cpu_features = cpuid_info.feature_flags();
+    LINUX_ONLY(new_cpu_glibc_features = cpuid_info.glibc_flags();)
+  }
+
+  uint64_t       features_missing =       _features & ~      new_cpu_features;
+  uint64_t glibc_features_missing = _glibc_features & ~new_cpu_glibc_features;
+
+  // Workaround JDK-8311164: CPU_HT is set randomly on hybrid CPUs like Alder Lake.
+  features_missing &= ~CPU_HT;
+
+  _crac_restore_missing_features = features_missing || glibc_features_missing;
+  if (_crac_restore_missing_features) {
+    static const char part1[] = "You have to specify -XX:CPUFeatures=";
+    tty->print_raw(part1, sizeof(part1) - 1);
+    nonlibc_tty_print_uint64_comma_uint64(new_cpu_features & _features, new_cpu_glibc_features & _glibc_features);
+    static const char part2[] = " together with -XX:CRaCCheckpointTo when making a checkpoint file; specified -XX:CRaCRestoreFrom file contains CPU features ";
+    tty->print_raw(part2, sizeof(part2) - 1);
+    nonlibc_tty_print_uint64_comma_uint64(_features, _glibc_features);
+    missing_features(features_missing, glibc_features_missing);
+  }
+
+  if (ShowCPUFeatures)
+    print_using_features_cr();
+}
+
+void VM_Version::crac_restore_finalize() {
+  if (_crac_restore_missing_features && !IgnoreCPUFeatures) {
+    vm_exit_during_initialization();
+  }
+}
+
 #ifdef COMPILER2
 // Determine if it's running on Cascade Lake using default options.
 bool VM_Version::is_default_intel_cascade_lake() {
@@ -2123,7 +2670,53 @@ void VM_Version::initialize() {
   detect_virt_stub = CAST_TO_FN_PTR(detect_virt_stub_t,
                                      g.generate_detect_virt());
 
-  get_processor_features();
+  assert(      _features == 0,       "_features should be zero at startup");
+  assert(_glibc_features == 0, "_glibc_features should be zero at startup");
+  get_processor_features_hardware();
+
+  assert(!CPUFeatures == FLAG_IS_DEFAULT(CPUFeatures), "CPUFeatures parsing");
+  uint64_t GLIBCFeatures_x64;
+  uint64_t   CPUFeatures_x64 = CPUFeatures_parse(GLIBCFeatures_x64);
+  uint64_t       features_missing =   CPUFeatures_x64 & ~      _features;
+  uint64_t glibc_features_missing = GLIBCFeatures_x64 & ~_glibc_features;
+
+  // Workaround JDK-8311164: CPU_HT is set randomly on hybrid CPUs like Alder Lake.
+  features_missing &= ~CPU_HT;
+
+  if (features_missing || glibc_features_missing) {
+    static const char part1[] = "Specified -XX:CPUFeatures=";
+    tty->print_raw(part1, sizeof(part1) - 1);
+    nonlibc_tty_print_uint64_comma_uint64(CPUFeatures_x64, GLIBCFeatures_x64);
+    static const char part2[] = "; this machine's CPU features are ";
+    tty->print_raw(part2, sizeof(part2) - 1);
+    nonlibc_tty_print_uint64_comma_uint64(_features, _glibc_features);
+    missing_features(features_missing, glibc_features_missing);
+    vm_exit_during_initialization();
+  }
+
+  uint64_t       features_saved =       _features;
+  uint64_t glibc_features_saved = _glibc_features;
+
+        _features =   CPUFeatures_x64;
+  _glibc_features = GLIBCFeatures_x64;
+
+  if (ShowCPUFeatures)
+    print_using_features_cr();
+
+#ifdef LINUX
+  if (!_ignore_glibc_not_using) {
+    uint64_t       features_expected =   MAX_CPU - 1;
+    uint64_t glibc_features_expected = MAX_GLIBC - 1;
+    if (!INCLUDE_CPU_FEATURE_ACTIVE) {
+            features_expected =       features_saved;
+      glibc_features_expected = glibc_features_saved;
+    }
+    glibc_not_using(      features_expected & ~      _features,
+                    glibc_features_expected & ~_glibc_features);
+  }
+#endif
+
+  get_processor_features_hotspot();
 
   LP64_ONLY(Assembler::precompute_instructions();)
 
@@ -2884,13 +3477,13 @@ int64_t VM_Version::maximum_qualified_cpu_frequency(void) {
   return _max_qualified_cpu_frequency;
 }
 
-uint64_t VM_Version::feature_flags() {
+uint64_t VM_Version::CpuidInfo::feature_flags() const {
   uint64_t result = 0;
-  if (_cpuid_info.std_cpuid1_edx.bits.cmpxchg8 != 0)
+  if (std_cpuid1_edx.bits.cmpxchg8 != 0)
     result |= CPU_CX8;
-  if (_cpuid_info.std_cpuid1_edx.bits.cmov != 0)
+  if (std_cpuid1_edx.bits.cmov != 0)
     result |= CPU_CMOV;
-  if (_cpuid_info.std_cpuid1_edx.bits.clflush != 0)
+  if (std_cpuid1_edx.bits.clflush != 0)
     result |= CPU_FLUSH;
 #ifdef _LP64
   // clflush should always be available on x86_64
@@ -2898,158 +3491,158 @@ uint64_t VM_Version::feature_flags() {
   // to flush the code cache.
   assert ((result & CPU_FLUSH) != 0, "clflush should be available");
 #endif
-  if (_cpuid_info.std_cpuid1_edx.bits.fxsr != 0 || (is_amd_family() &&
-      _cpuid_info.ext_cpuid1_edx.bits.fxsr != 0))
+  if (std_cpuid1_edx.bits.fxsr != 0 || (is_amd_family() &&
+      ext_cpuid1_edx.bits.fxsr != 0))
     result |= CPU_FXSR;
   // HT flag is set for multi-core processors also.
   if (threads_per_core() > 1)
     result |= CPU_HT;
-  if (_cpuid_info.std_cpuid1_edx.bits.mmx != 0 || (is_amd_family() &&
-      _cpuid_info.ext_cpuid1_edx.bits.mmx != 0))
+  if (std_cpuid1_edx.bits.mmx != 0 || (is_amd_family() &&
+      ext_cpuid1_edx.bits.mmx != 0))
     result |= CPU_MMX;
-  if (_cpuid_info.std_cpuid1_edx.bits.sse != 0)
+  if (std_cpuid1_edx.bits.sse != 0)
     result |= CPU_SSE;
-  if (_cpuid_info.std_cpuid1_edx.bits.sse2 != 0)
+  if (std_cpuid1_edx.bits.sse2 != 0)
     result |= CPU_SSE2;
-  if (_cpuid_info.std_cpuid1_ecx.bits.sse3 != 0)
+  if (std_cpuid1_ecx.bits.sse3 != 0)
     result |= CPU_SSE3;
-  if (_cpuid_info.std_cpuid1_ecx.bits.ssse3 != 0)
+  if (std_cpuid1_ecx.bits.ssse3 != 0)
     result |= CPU_SSSE3;
-  if (_cpuid_info.std_cpuid1_ecx.bits.sse4_1 != 0)
+  if (std_cpuid1_ecx.bits.sse4_1 != 0)
     result |= CPU_SSE4_1;
-  if (_cpuid_info.std_cpuid1_ecx.bits.sse4_2 != 0)
+  if (std_cpuid1_ecx.bits.sse4_2 != 0)
     result |= CPU_SSE4_2;
-  if (_cpuid_info.std_cpuid1_ecx.bits.popcnt != 0)
+  if (std_cpuid1_ecx.bits.popcnt != 0)
     result |= CPU_POPCNT;
-  if (_cpuid_info.std_cpuid1_ecx.bits.avx != 0 &&
-      _cpuid_info.std_cpuid1_ecx.bits.osxsave != 0 &&
-      _cpuid_info.xem_xcr0_eax.bits.sse != 0 &&
-      _cpuid_info.xem_xcr0_eax.bits.ymm != 0) {
+  if (std_cpuid1_ecx.bits.avx != 0 &&
+      std_cpuid1_ecx.bits.osxsave != 0 &&
+      xem_xcr0_eax.bits.sse != 0 &&
+      xem_xcr0_eax.bits.ymm != 0) {
     result |= CPU_AVX;
     result |= CPU_VZEROUPPER;
-    if (_cpuid_info.std_cpuid1_ecx.bits.f16c != 0)
+    if (std_cpuid1_ecx.bits.f16c != 0)
       result |= CPU_F16C;
-    if (_cpuid_info.sef_cpuid7_ebx.bits.avx2 != 0)
+    if (sef_cpuid7_ebx.bits.avx2 != 0)
       result |= CPU_AVX2;
-    if (_cpuid_info.sef_cpuid7_ebx.bits.avx512f != 0 &&
-        _cpuid_info.xem_xcr0_eax.bits.opmask != 0 &&
-        _cpuid_info.xem_xcr0_eax.bits.zmm512 != 0 &&
-        _cpuid_info.xem_xcr0_eax.bits.zmm32 != 0) {
+    if (sef_cpuid7_ebx.bits.avx512f != 0 &&
+        xem_xcr0_eax.bits.opmask != 0 &&
+        xem_xcr0_eax.bits.zmm512 != 0 &&
+        xem_xcr0_eax.bits.zmm32 != 0) {
       result |= CPU_AVX512F;
-      if (_cpuid_info.sef_cpuid7_ebx.bits.avx512cd != 0)
+      if (sef_cpuid7_ebx.bits.avx512cd != 0)
         result |= CPU_AVX512CD;
-      if (_cpuid_info.sef_cpuid7_ebx.bits.avx512dq != 0)
+      if (sef_cpuid7_ebx.bits.avx512dq != 0)
         result |= CPU_AVX512DQ;
-      if (_cpuid_info.sef_cpuid7_ebx.bits.avx512ifma != 0)
+      if (sef_cpuid7_ebx.bits.avx512ifma != 0)
         result |= CPU_AVX512_IFMA;
-      if (_cpuid_info.sef_cpuid7_ebx.bits.avx512pf != 0)
+      if (sef_cpuid7_ebx.bits.avx512pf != 0)
         result |= CPU_AVX512PF;
-      if (_cpuid_info.sef_cpuid7_ebx.bits.avx512er != 0)
+      if (sef_cpuid7_ebx.bits.avx512er != 0)
         result |= CPU_AVX512ER;
-      if (_cpuid_info.sef_cpuid7_ebx.bits.avx512bw != 0)
+      if (sef_cpuid7_ebx.bits.avx512bw != 0)
         result |= CPU_AVX512BW;
-      if (_cpuid_info.sef_cpuid7_ebx.bits.avx512vl != 0)
+      if (sef_cpuid7_ebx.bits.avx512vl != 0)
         result |= CPU_AVX512VL;
-      if (_cpuid_info.sef_cpuid7_ecx.bits.avx512_vpopcntdq != 0)
+      if (sef_cpuid7_ecx.bits.avx512_vpopcntdq != 0)
         result |= CPU_AVX512_VPOPCNTDQ;
-      if (_cpuid_info.sef_cpuid7_ecx.bits.avx512_vpclmulqdq != 0)
+      if (sef_cpuid7_ecx.bits.avx512_vpclmulqdq != 0)
         result |= CPU_AVX512_VPCLMULQDQ;
-      if (_cpuid_info.sef_cpuid7_ecx.bits.vaes != 0)
+      if (sef_cpuid7_ecx.bits.vaes != 0)
         result |= CPU_AVX512_VAES;
-      if (_cpuid_info.sef_cpuid7_ecx.bits.gfni != 0)
+      if (sef_cpuid7_ecx.bits.gfni != 0)
         result |= CPU_GFNI;
-      if (_cpuid_info.sef_cpuid7_ecx.bits.avx512_vnni != 0)
+      if (sef_cpuid7_ecx.bits.avx512_vnni != 0)
         result |= CPU_AVX512_VNNI;
-      if (_cpuid_info.sef_cpuid7_ecx.bits.avx512_bitalg != 0)
+      if (sef_cpuid7_ecx.bits.avx512_bitalg != 0)
         result |= CPU_AVX512_BITALG;
-      if (_cpuid_info.sef_cpuid7_ecx.bits.avx512_vbmi != 0)
+      if (sef_cpuid7_ecx.bits.avx512_vbmi != 0)
         result |= CPU_AVX512_VBMI;
-      if (_cpuid_info.sef_cpuid7_ecx.bits.avx512_vbmi2 != 0)
+      if (sef_cpuid7_ecx.bits.avx512_vbmi2 != 0)
         result |= CPU_AVX512_VBMI2;
     }
   }
-  if (_cpuid_info.std_cpuid1_ecx.bits.hv != 0)
+  if (std_cpuid1_ecx.bits.hv != 0)
     result |= CPU_HV;
-  if (_cpuid_info.sef_cpuid7_ebx.bits.bmi1 != 0)
+  if (sef_cpuid7_ebx.bits.bmi1 != 0)
     result |= CPU_BMI1;
-  if (_cpuid_info.std_cpuid1_edx.bits.tsc != 0)
+  if (std_cpuid1_edx.bits.tsc != 0)
     result |= CPU_TSC;
-  if (_cpuid_info.ext_cpuid7_edx.bits.tsc_invariance != 0)
+  if (ext_cpuid7_edx.bits.tsc_invariance != 0)
     result |= CPU_TSCINV_BIT;
   if (_cpuid_info.std_cpuid1_ecx.bits.aes != 0)
     result |= CPU_AES;
-  if (_cpuid_info.sef_cpuid7_ebx.bits.erms != 0)
+  if (sef_cpuid7_ebx.bits.erms != 0)
     result |= CPU_ERMS;
-  if (_cpuid_info.sef_cpuid7_edx.bits.fast_short_rep_mov != 0)
+  if (sef_cpuid7_edx.bits.fast_short_rep_mov != 0)
     result |= CPU_FSRM;
-  if (_cpuid_info.std_cpuid1_ecx.bits.clmul != 0)
+  if (std_cpuid1_ecx.bits.clmul != 0)
     result |= CPU_CLMUL;
-  if (_cpuid_info.sef_cpuid7_ebx.bits.rtm != 0)
+  if (sef_cpuid7_ebx.bits.rtm != 0)
     result |= CPU_RTM;
-  if (_cpuid_info.sef_cpuid7_ebx.bits.adx != 0)
+  if (sef_cpuid7_ebx.bits.adx != 0)
      result |= CPU_ADX;
-  if (_cpuid_info.sef_cpuid7_ebx.bits.bmi2 != 0)
+  if (sef_cpuid7_ebx.bits.bmi2 != 0)
     result |= CPU_BMI2;
-  if (_cpuid_info.sef_cpuid7_ebx.bits.sha != 0)
+  if (sef_cpuid7_ebx.bits.sha != 0)
     result |= CPU_SHA;
-  if (_cpuid_info.std_cpuid1_ecx.bits.fma != 0)
+  if (std_cpuid1_ecx.bits.fma != 0)
     result |= CPU_FMA;
-  if (_cpuid_info.sef_cpuid7_ebx.bits.clflushopt != 0)
+  if (sef_cpuid7_ebx.bits.clflushopt != 0)
     result |= CPU_FLUSHOPT;
-  if (_cpuid_info.ext_cpuid1_edx.bits.rdtscp != 0)
+  if (ext_cpuid1_edx.bits.rdtscp != 0)
     result |= CPU_RDTSCP;
-  if (_cpuid_info.sef_cpuid7_ecx.bits.rdpid != 0)
+  if (sef_cpuid7_ecx.bits.rdpid != 0)
     result |= CPU_RDPID;
 
   // AMD|Hygon features.
   if (is_amd_family()) {
-    if ((_cpuid_info.ext_cpuid1_edx.bits.tdnow != 0) ||
-        (_cpuid_info.ext_cpuid1_ecx.bits.prefetchw != 0))
+    if ((ext_cpuid1_edx.bits.tdnow != 0) ||
+        (ext_cpuid1_ecx.bits.prefetchw != 0))
       result |= CPU_3DNOW_PREFETCH;
-    if (_cpuid_info.ext_cpuid1_ecx.bits.lzcnt != 0)
+    if (ext_cpuid1_ecx.bits.lzcnt != 0)
       result |= CPU_LZCNT;
-    if (_cpuid_info.ext_cpuid1_ecx.bits.sse4a != 0)
+    if (ext_cpuid1_ecx.bits.sse4a != 0)
       result |= CPU_SSE4A;
   }
 
   // Intel features.
   if (is_intel()) {
-    if (_cpuid_info.ext_cpuid1_ecx.bits.lzcnt != 0) {
+    if (ext_cpuid1_ecx.bits.lzcnt != 0) {
       result |= CPU_LZCNT;
     }
-    if (_cpuid_info.ext_cpuid1_ecx.bits.prefetchw != 0) {
+    if (ext_cpuid1_ecx.bits.prefetchw != 0) {
       result |= CPU_3DNOW_PREFETCH;
     }
-    if (_cpuid_info.sef_cpuid7_ebx.bits.clwb != 0) {
+    if (sef_cpuid7_ebx.bits.clwb != 0) {
       result |= CPU_CLWB;
     }
-    if (_cpuid_info.sef_cpuid7_edx.bits.serialize != 0)
+    if (sef_cpuid7_edx.bits.serialize != 0)
       result |= CPU_SERIALIZE;
   }
 
   // ZX features.
   if (is_zx()) {
-    if (_cpuid_info.ext_cpuid1_ecx.bits.lzcnt != 0) {
+    if (ext_cpuid1_ecx.bits.lzcnt != 0) {
       result |= CPU_LZCNT;
     }
-    if (_cpuid_info.ext_cpuid1_ecx.bits.prefetchw != 0) {
+    if (ext_cpuid1_ecx.bits.prefetchw != 0) {
       result |= CPU_3DNOW_PREFETCH;
     }
   }
 
   // Protection key features.
-  if (_cpuid_info.sef_cpuid7_ecx.bits.pku != 0) {
+  if (sef_cpuid7_ecx.bits.pku != 0) {
     result |= CPU_PKU;
   }
-  if (_cpuid_info.sef_cpuid7_ecx.bits.ospke != 0) {
+  if (sef_cpuid7_ecx.bits.ospke != 0) {
     result |= CPU_OSPKE;
   }
 
   // Control flow enforcement (CET) features.
-  if (_cpuid_info.sef_cpuid7_ecx.bits.cet_ss != 0) {
+  if (sef_cpuid7_ecx.bits.cet_ss != 0) {
     result |= CPU_CET_SS;
   }
-  if (_cpuid_info.sef_cpuid7_edx.bits.cet_ibt != 0) {
+  if (sef_cpuid7_edx.bits.cet_ibt != 0) {
     result |= CPU_CET_IBT;
   }
 
