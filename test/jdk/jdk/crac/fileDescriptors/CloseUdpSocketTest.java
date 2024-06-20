@@ -46,7 +46,7 @@ public class CloseUdpSocketTest extends FDPolicyTestBase implements CracTest {
     public void test() throws Exception {
         String loopback = InetAddress.getLoopbackAddress().getHostAddress();
         Path config = writeConfig("""
-                type: socket
+                type: filedescriptor
                 localAddress: $loopback
                 action: close
                 """.replace("$loopback", loopback));
