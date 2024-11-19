@@ -1,10 +1,11 @@
 [general]
 project=crac-updates
 jbs=JDK
-version=21.0.4
+version=21.0.5
 
 [checks]
-error=whitespace
+error=author,committer,reviewers,merge,issues,executable,symlink,message,hg-tag,whitespace,problemlists
+warning=issuestitle,binary
 
 [checks "reviewers"]
 committers=1
